@@ -1,0 +1,7 @@
+# Jupyter workbench and browser IDE images, workspace CLI and sidecar.
+deploy/jupyter/ jupyter/
+deploy/ide/ ide/
+deploy/workspace/ workspace/
+python/tests/test_workspace_cli.py tests/test_workspace_cli.py
+python/tests/test_workspace_directories.py tests/test_workspace_directories.py
+LICENCE

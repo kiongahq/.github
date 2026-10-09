@@ -1,0 +1,13 @@
+# Python SDK: client, agent helpers, LLM factory, tools.
+python/mlaiops_sdk/ mlaiops_sdk/
+python/pyproject.toml pyproject.toml
+python/tests/test_client.py tests/test_client.py
+python/tests/test_client_workflows.py tests/test_client_workflows.py
+python/tests/test_agents.py tests/test_agents.py
+python/tests/test_huggingface.py tests/test_huggingface.py
+python/tests/test_llm.py tests/test_llm.py
+python/tests/test_primitives.py tests/test_primitives.py
+python/tests/test_tools_langchain.py tests/test_tools_langchain.py
+examples/quickstart.py examples/quickstart.py
+notebooks/eda.ipynb notebooks/eda.ipynb
+LICENCE

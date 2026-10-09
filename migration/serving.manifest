@@ -1,0 +1,9 @@
+# Model serving manager (Go).
+go/cmd/serving-manager/ cmd/serving-manager/
+go/internal/serving/ internal/serving/
+go/internal/runtimeconfig/ internal/runtimeconfig/
+go/go.mod go.mod
+go/go.sum go.sum
+go/Dockerfile Dockerfile
+go/.dockerignore .dockerignore
+LICENCE

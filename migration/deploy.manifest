@@ -1,0 +1,22 @@
+# How the components run together: Compose, Helm, kind, VM edge, cluster config.
+deploy/ .
+!deploy/jupyter/
+!deploy/ide/
+!deploy/workspace/
+config/ config/
+scripts/build_inputs.py scripts/build_inputs.py
+scripts/local-up.sh scripts/local-up.sh
+scripts/local-topics.sh scripts/local-topics.sh
+scripts/kind-up.sh scripts/kind-up.sh
+scripts/e2e-kind.sh scripts/e2e-kind.sh
+scripts/deploy-kubernetes.sh scripts/deploy-kubernetes.sh
+scripts/bootstrap-k8s-tools.sh scripts/bootstrap-k8s-tools.sh
+scripts/cloud-preflight.py scripts/cloud-preflight.py
+scripts/verify-production.py scripts/verify-production.py
+scripts/demo-smoke.sh scripts/demo-smoke.sh
+scripts/stress-test.sh scripts/stress-test.sh
+tests/load/ tests/load/
+python/tests/test_local_bootstrap.py tests/test_local_bootstrap.py
+python/tests/test_production_deploy.py tests/test_production_deploy.py
+.env.example .env.example
+LICENCE

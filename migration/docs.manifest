@@ -1,0 +1,6 @@
+# Documentation site (MkDocs Material), published to GitHub Pages.
+docs/ docs/
+!docs/hosting 2.md
+mkdocs.yml mkdocs.yml
+requirements-docs.txt requirements-docs.txt
+LICENCE

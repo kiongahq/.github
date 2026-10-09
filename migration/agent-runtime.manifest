@@ -1,0 +1,12 @@
+# Agent runtime service plus the Python workers that share its image:
+# example agents, feature materializer, realtime processor.
+python/agent_runtime/ agent_runtime/
+python/agents/ agents/
+python/features/ features/
+python/realtime/ realtime/
+python/tests/test_agent_adapters.py tests/test_agent_adapters.py
+python/tests/test_agent_runtime.py tests/test_agent_runtime.py
+python/tests/test_feature_store_correctness.py tests/test_feature_store_correctness.py
+python/tests/test_features.py tests/test_features.py
+python/tests/test_realtime.py tests/test_realtime.py
+LICENCE

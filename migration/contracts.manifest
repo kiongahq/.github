@@ -1,0 +1,4 @@
+# Versioned schemas shared by the platform, SDK and runners.
+contracts/ .
+python/tests/test_pipeline_schema.py tests/test_pipeline_schema.py
+LICENCE

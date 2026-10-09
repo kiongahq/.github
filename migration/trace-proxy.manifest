@@ -1,0 +1,9 @@
+# OpenAI-compatible LLM proxy with tracing (Go).
+go/cmd/trace-proxy/ cmd/trace-proxy/
+go/internal/traceproxy/ internal/traceproxy/
+go/internal/runtimeconfig/ internal/runtimeconfig/
+go/go.mod go.mod
+go/go.sum go.sum
+go/Dockerfile Dockerfile
+go/.dockerignore .dockerignore
+LICENCE

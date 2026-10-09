@@ -1,0 +1,13 @@
+# Every Kionga repository, in dependency order. deploy's workspace script and
+# gh-org-clone.sh --repos read this list.
+.github
+contracts
+sdk-python
+platform
+agent-runtime
+pipeline-runner
+serving
+trace-proxy
+workspace
+deploy
+docs

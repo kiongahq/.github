@@ -1,0 +1,33 @@
+name: Go
+
+# Reusable Go checks for Kionga services:
+#   jobs:
+#     go:
+#       uses: kiongahq/.github/.github/workflows/go.yml@main
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        type: string
+        default: "."
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.working-directory }}/go.mod
+          cache-dependency-path: ${{ inputs.working-directory }}/go.sum
+      - name: gofmt
+        run: gofmt -l . | tee /tmp/unformatted && test ! -s /tmp/unformatted
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./...

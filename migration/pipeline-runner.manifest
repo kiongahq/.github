@@ -1,0 +1,5 @@
+# Prefect runner that executes pipeline definitions (ready-set DAG executor).
+python/pipelines/ pipelines/
+python/tests/test_pipeline_definition.py tests/test_pipeline_definition.py
+python/tests/test_pipelines.py tests/test_pipelines.py
+LICENCE
