@@ -27,7 +27,7 @@ jobs:
 ## migration/
 
 Each `*.manifest` lists the paths one repository took from the platform monorepo
-(at commit `441621b`), with their history, using
+(at commit `441621b`, which is `c69f52d` after the history rewrite that removed a draft file), with their history, using
 [`git-split-repo.sh`](https://github.com/Markkimotho/automation-scripts-utils):
 
 ```bash
