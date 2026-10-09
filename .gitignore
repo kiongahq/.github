@@ -1,0 +1,13 @@
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.env
+.env.*
+!.env.example
+
+# Local coding-assistant state.
+.claude/
+.codex/
+.cursor/
+.aider*
