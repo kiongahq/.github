@@ -1,9 +1,9 @@
 # Kionga
 
-Self-hosted platform for building, deploying and operating ML models and AI agents:
+MIT-licensed, self-hosted platform for building, deploying and operating ML models and AI agents:
 projects and Jupyter/IDE workspaces, versioned pipeline DAGs with schedules, model
 registry and serving, agents with memory, tools and tracing, feature stores, logs and
-fine-grained access policies, in one console. Open source components by default.
+fine-grained access policies, in one console.
 
 **Start here:** [Documentation](https://kiongahq.github.io/docs/) ·
 [Run it locally](https://github.com/kiongahq/deploy#run-it-locally)
