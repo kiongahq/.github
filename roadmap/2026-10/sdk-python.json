@@ -1,0 +1,308 @@
+[
+  {
+    "title": "Raise typed SDK exceptions that carry the gateway error body and status",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:client"
+    ],
+    "body": "## Problem\nEvery call ends in `response.raise_for_status()` (`mlaiops_sdk/client.py:362`, and again in `invoke_agent` at `mlaiops_sdk/client.py:284`). Callers get a bare `httpx.HTTPStatusError`, so they must import httpx to catch failures, cannot tell a 404 from a 409 or 403 without inspecting `response.status_code`, and never see the gateway's JSON error message unless they dig into `error.response`. Transport failures (`httpx.ConnectError`, `httpx.ReadTimeout`) also leak through untouched.\n\n## Proposal\nAdd `mlaiops_sdk/errors.py` with `MLAIOpsError` as the base class, then `APIStatusError` (with `status_code`, `request_id`, `message`, `body`) and subclasses `BadRequestError`, `AuthenticationError` (401), `PermissionDeniedError` (403), `NotFoundError`, `ConflictError`, `RateLimitError`, `ServerError`, plus `APIConnectionError` and `APITimeoutError` for transport failures. `_request` parses the error body when it is JSON and raises the mapped class. Export everything from `mlaiops_sdk/__init__.py`.\n\n## Acceptance criteria\n- [ ] `_request` and `invoke_agent` raise subclasses of `MLAIOpsError`. Neither raises raw `httpx` exceptions.\n- [ ] The exception message includes the gateway's `error`/`message` field when one is present.\n- [ ] `tests/test_errors.py` uses `httpx.MockTransport` to cover 400, 401, 403, 404, 409, 429, 500 and a connect error, asserting the class raised and its `status_code`.\n- [ ] README has an \"Error handling\" section with a `try/except NotFoundError` example."
+  },
+  {
+    "title": "Add configurable retries with exponential backoff for idempotent requests",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:client"
+    ],
+    "body": "## Problem\n`MLAIOpsClient.__init__` creates a plain `httpx.Client` with one scalar `timeout=10.0` and no retry policy (`mlaiops_sdk/client.py:33`, `mlaiops_sdk/client.py:42-47`). `_request` sends each call exactly once (`mlaiops_sdk/client.py:361`). A gateway restart, a 502/503 from the ingress, or a transient connect error makes long training jobs and notebooks fail on calls such as `get_pipeline_run`, which are safe to repeat.\n\n## Proposal\nAdd `max_retries: int = 2` and accept `timeout: float | httpx.Timeout` in the constructor. Retry GET, PUT and DELETE on connect errors, read timeouts, 429, 502, 503 and 504. Use exponential backoff with jitter and honor `Retry-After`. Do not retry POST unless the caller passes an idempotency key: send an `Idempotency-Key` header on create calls when one is supplied. Allow per-call overrides through a `with_options(max_retries=..., timeout=...)` copy.\n\n## Acceptance criteria\n- [ ] A GET that returns 503 twice and then 200 succeeds with the default settings. A MockTransport test asserts exactly 3 requests.\n- [ ] A POST without an idempotency key is attempted once on a 503. A test asserts this.\n- [ ] `Retry-After: 1` is honored. The test patches the sleep function and asserts it was called with 1.\n- [ ] `max_retries=0` disables retries and is documented in the constructor docstring."
+  },
+  {
+    "title": "Provide AsyncMLAIOpsClient with parity to the sync client",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:client"
+    ],
+    "body": "## Problem\nThe SDK ships only the synchronous `MLAIOpsClient` built on `httpx.Client` (`mlaiops_sdk/client.py:24`, `mlaiops_sdk/client.py:42`). The agent stack it targets is async: the LangGraph checkpointer is `AsyncPostgresSaver` (`mlaiops_sdk/agents.py:54-60`) and the adapters expose `ainvoke`/`astream` (`mlaiops_sdk/agent_adapters.py:62`, `mlaiops_sdk/agent_adapters.py:91`). Calling `client.invoke_agent` (`mlaiops_sdk/client.py:269-285`, 120 s timeout) from an async node blocks the event loop.\n\n## Proposal\nMove request building and response parsing into a transport-neutral layer shared by `MLAIOpsClient` and a new `AsyncMLAIOpsClient` that wraps `httpx.AsyncClient`. Support `async with`, `aclose()`, and accept an `httpx.AsyncBaseTransport` for tests. Retries and error mapping must behave the same in both clients.\n\n## Acceptance criteria\n- [ ] `AsyncMLAIOpsClient` exposes every public method of `MLAIOpsClient` as a coroutine. A test compares the two public method sets.\n- [ ] Existing client tests are parametrized to run against both clients with `httpx.MockTransport`.\n- [ ] `async with AsyncMLAIOpsClient() as c:` closes the underlying client. A test asserts `is_closed`.\n- [ ] README shows an async example."
+  },
+  {
+    "title": "Fetch all pages in list methods instead of silently returning the first page",
+    "labels": [
+      "bug",
+      "P2",
+      "area:client"
+    ],
+    "body": "## Problem\n`_page` returns `self._request(\"GET\", path)[\"items\"]` and drops the `total` field that the gateway returns (`mlaiops_sdk/client.py:357-358`; the mock in `tests/test_client.py` returns `{\"items\": [...], \"total\": 1}`). No page or cursor parameter is ever sent, so `list_models`, `list_agents`, `audit_events` and the others return a single server page with no warning once a tenant has more rows than the page size. `list_projects` and `list_pipeline_runs` expect a bare list instead (`mlaiops_sdk/client.py:62`, `mlaiops_sdk/client.py:117`), so they will break if those endpoints move to the paged envelope.\n\n## Proposal\nAdd a `Page[T]` generic model (`items`, `total`, `next_cursor` or offset) and an `iter_*` / auto-paginating iterator that follows pages until it reaches `total`. Keep the `list_*` names, but return a `SyncPage[T]` that is iterable across all pages and exposes `.total`. Accept `limit` and filter kwargs where the API supports them. Make `list_projects` and `list_pipeline_runs` accept either envelope during the transition.\n\n## Acceptance criteria\n- [ ] A MockTransport test serving 3 pages of 2 items asserts that `list(client.list_models())` yields 6 models and sends 3 requests.\n- [ ] `.total` is exposed on the returned page object.\n- [ ] `list_projects` works against both a bare list and an `{items,total}` envelope. Both shapes are tested.\n- [ ] `audit_events` accepts a `limit` argument that is forwarded as a query parameter."
+  },
+  {
+    "title": "URL-encode path segments and query values built from caller input",
+    "labels": [
+      "security",
+      "P2",
+      "area:client"
+    ],
+    "body": "## Problem\nResource IDs and names go into URLs through f-strings with no encoding, for example `f\"/api/v1/projects/{project_id}\"` (`mlaiops_sdk/client.py:109`), `f\"/api/v1/functions/{name}/invoke\"` (`mlaiops_sdk/client.py:156`) and `f\"/api/v1/agents/{agent_id}/invoke\"` (`mlaiops_sdk/client.py:280`). `get_project_template` builds its query string by hand: `f\"?version={version}\"` (`mlaiops_sdk/client.py:73`). An ID that contains `/`, `?`, `#` or `../`, for example one taken from an LLM tool argument inside an agent, can point the authenticated request at a different gateway endpoint or inject query parameters, all with the caller's bearer token.\n\n## Proposal\nAdd a `_path(*segments)` helper that applies `urllib.parse.quote(segment, safe=\"\")` to each segment and rejects empty values. Move every query string to `params=`. Validate IDs against the gateway's ID pattern where one is documented.\n\n## Acceptance criteria\n- [ ] No f-string URL in `client.py` interpolates raw caller input. A grep-based test or ruff rule enforces this.\n- [ ] `get_project(\"../audit\")` sends a path of `/api/v1/projects/..%2Faudit`. A MockTransport test asserts `request.url.raw_path`.\n- [ ] `get_project_template(\"t\", version=\"1&x=y\")` sends `version=1%26x%3Dy` as a single parameter. This is tested.\n- [ ] Empty IDs raise `ValueError` before any request is sent."
+  },
+  {
+    "title": "Refuse to send the bearer token over plaintext HTTP to non-loopback hosts",
+    "labels": [
+      "security",
+      "P1",
+      "area:auth"
+    ],
+    "body": "## Problem\nThe client defaults to `http://localhost:8080` and accepts any `MLAIOPS_URL` (`mlaiops_sdk/client.py:36-37`). Whenever a token is present it attaches `Authorization: Bearer ...` unconditionally (`mlaiops_sdk/client.py:38-39`). `record_trace` does the same with `MLAIOPS_TOKEN` against `MLAIOPS_URL` (`mlaiops_sdk/tracing.py:172-183`). A local IDE user who sets `MLAIOPS_URL=http://gateway.example.com` sends their scoped personal key in cleartext on every request. The README tells exactly these users to set `MLAIOPS_TOKEN` (`README.md:19-21`).\n\n## Proposal\nIf a token is configured and the URL scheme is `http` with a host other than a loopback address (`localhost`, `127.0.0.0/8`, `::1`), raise `InsecureTransportError` at construction. Add an explicit opt-out, `allow_insecure_http=True` or `MLAIOPS_ALLOW_INSECURE_HTTP=1`, that logs a warning. Apply the same check in `record_trace`.\n\n## Acceptance criteria\n- [ ] `MLAIOpsClient(\"http://gateway.example.com\", token=\"t\")` raises. The same URL with `allow_insecure_http=True` succeeds and emits a warning. Both cases are tested.\n- [ ] `http://localhost:8080` and `http://127.0.0.1:9000` with a token continue to work. This is tested.\n- [ ] `record_trace` does not send the Authorization header to an insecure non-loopback URL. A test patches `httpx.post`.\n- [ ] The README auth section documents the rule and the opt-out."
+  },
+  {
+    "title": "Support pluggable token providers and keep tokens out of reprs and logs",
+    "labels": [
+      "security",
+      "P2",
+      "area:auth"
+    ],
+    "body": "## Problem\nThe token is read once from the argument or `MLAIOPS_TOKEN` and baked into static default headers (`mlaiops_sdk/client.py:38-39`, `mlaiops_sdk/client.py:42-47`). A long-running training job or agent cannot rotate a short-lived workspace token without rebuilding the client. Nothing stops the raw header value from appearing in debug output once logging or `httpx` event hooks are added, and `tracing.record_trace` reads the env token separately (`mlaiops_sdk/tracing.py:176-177`).\n\n## Proposal\nImplement an `httpx.Auth` subclass `BearerAuth` that accepts either a static `str` or a `Callable[[], str]` token provider, and calls the provider per request or when the response is a 401 (single refresh and retry). Store the token as `pydantic.SecretStr`. Add a `__repr__` to `MLAIOpsClient` that shows `base_url` and `token=***`. Have `record_trace` reuse the same auth resolution.\n\n## Acceptance criteria\n- [ ] `MLAIOpsClient(token=lambda: next(tokens))` sends the fresh token on each request. This is tested with MockTransport.\n- [ ] A 401 triggers exactly one provider refresh and retry. A test asserts 2 requests and 2 provider calls.\n- [ ] `repr(client)` and `str(client)` never contain the token. A test asserts this.\n- [ ] Token-provider usage is documented in the README auth section."
+  },
+  {
+    "title": "Return typed models from invoke_agent, invoke_function, health and HF search",
+    "labels": [
+      "dx",
+      "P2",
+      "area:client"
+    ],
+    "body": "## Problem\nSeveral public methods return untyped dicts, while the rest of the client returns pydantic models: `health() -> dict[str, str]` (`mlaiops_sdk/client.py:58`), `invoke_function -> dict` (`mlaiops_sdk/client.py:155`), `invoke_function_async -> dict` (`mlaiops_sdk/client.py:158`), `search_huggingface_models -> list[dict]` (`mlaiops_sdk/client.py:167`), and `invoke_agent -> dict` (`mlaiops_sdk/client.py:277`). `invoke_agent` also bypasses `_request` and calls `self._client.post` directly (`mlaiops_sdk/client.py:279-285`), so any future error mapping or retry logic would skip it. `_request` itself has no return annotation (`mlaiops_sdk/client.py:360`).\n\n## Proposal\nAdd `Health`, `AgentInvocation` (reply, session_id, usage, trace_id), `AsyncInvocation` (call_id, accepted) and `HuggingFaceModelSummary` models. Route `invoke_agent` through `_request` with a per-call timeout. Keep `invoke_function` returning `Any` for user payloads, and add a `response_model: type[T] | None` parameter that validates the payload when given. Annotate `_request` as returning `Any`, and add typed `_get[T]` helpers.\n\n## Acceptance criteria\n- [ ] `invoke_agent` returns `AgentInvocation` and goes through `_request`. A test asserts that the per-call timeout reaches the transport.\n- [ ] `health()` returns `Health` and `search_huggingface_models` returns `list[HuggingFaceModelSummary]`.\n- [ ] `invoke_function(..., response_model=Score)` returns a `Score`. This is tested.\n- [ ] `mypy --strict mlaiops_sdk/client.py` reports no `Any` returns on public methods."
+  },
+  {
+    "title": "Stream agent turns and pipeline run logs over SSE",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:agents"
+    ],
+    "body": "## Problem\nAgent invocation is a single blocking POST with a 120 s timeout that returns a complete dict (`mlaiops_sdk/client.py:269-285`). Pipeline logs are only available as a `logs: list[dict]` snapshot embedded in `PipelineRun` (`mlaiops_sdk/models.py:65`), so watching a run means re-fetching the whole run. The adapter contract already models streaming (`astream`, `streaming_mode`) in `mlaiops_sdk/agent_adapters.py:56` and `mlaiops_sdk/agent_adapters.py:91-93`, but the client has no way to consume a stream.\n\n## Proposal\nAdd `client.stream_agent(agent_id, message, ...) -> Iterator[AgentEvent]` and `client.stream_pipeline_logs(run_id, follow=True) -> Iterator[LogEntry]` using `httpx` streaming and an SSE parser that handles `event:`, `data:`, `id:`, `retry:` and comments. Resume with `Last-Event-ID` on reconnect. Mirror both methods on the async client as async iterators. Close the response when the iterator is closed early.\n\n## Acceptance criteria\n- [ ] A MockTransport test streams a canned SSE body with multi-line `data:` and asserts the parsed `AgentEvent` sequence.\n- [ ] Breaking out of the loop closes the HTTP response. A test asserts `response.is_closed`.\n- [ ] A reconnect sends `Last-Event-ID` with the last seen id. This is tested.\n- [ ] README includes a log-tailing example."
+  },
+  {
+    "title": "Add wait_for_pipeline_run helper with timeout and terminal-state detection",
+    "labels": [
+      "dx",
+      "P3",
+      "area:pipelines"
+    ],
+    "body": "## Problem\nThe README promises users can \"submit and watch pipeline runs\" (`README.md:4`), but the client only offers point reads: `submit_pipeline` (`mlaiops_sdk/client.py:133-139`) and `get_pipeline_run` (`mlaiops_sdk/client.py:120-121`). `PipelineRun.status` is a free-form `str` (`mlaiops_sdk/models.py:55`), so every notebook writes its own polling loop and guesses at the terminal status names. `examples/quickstart.py:12-13` prints the initial status and exits.\n\n## Proposal\nAdd `client.wait_for_pipeline_run(run_id, *, timeout=3600, poll_interval=5, on_update=None) -> PipelineRun`. It polls with capped backoff, stops on terminal states (defined once as a constant alongside the status enum), and raises `PipelineRunFailed` (carrying the run) on failed or cancelled runs and `TimeoutError` past the deadline. Mirror it on the async client.\n\n## Acceptance criteria\n- [ ] A MockTransport test serving `queued`, `running`, `succeeded` returns the final run after 3 GETs, with the sleep function patched.\n- [ ] A `failed` run raises `PipelineRunFailed` with `.run.id` set. This is tested.\n- [ ] Exceeding `timeout` raises `TimeoutError`. This is tested with a fake clock.\n- [ ] `examples/quickstart.py` uses the helper."
+  },
+  {
+    "title": "Model status fields and nested run data as enums and typed models",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:models"
+    ],
+    "body": "## Problem\nEvery lifecycle field is a bare `str`: `Project.status` (`mlaiops_sdk/models.py:26`), `PipelineRun.status` (`mlaiops_sdk/models.py:55`), `Model.stage` (`mlaiops_sdk/models.py:108`), `Agent.status` (`mlaiops_sdk/models.py:141`). `PipelineRun.steps` and `logs` are `list[dict]` (`mlaiops_sdk/models.py:64-65`) and `PipelineDefinition.jobs` is `list[dict]` (`mlaiops_sdk/models.py:81`). Users get no autocomplete, typos like `promote_model(id, \"producton\")` (`mlaiops_sdk/client.py:204`) only fail server-side, and there is no stated policy for unknown values the gateway may add later.\n\n## Proposal\nIntroduce `StrEnum`s (`RunStatus`, `ModelStage`, `AgentStatus`, `ProjectStatus`) that fall back to the raw string for unknown members so older SDKs keep parsing newer responses. Add `RunStep`, `LogEntry` and `PipelineJob` models. Set `model_config = ConfigDict(extra=\"allow\")` on response models so new gateway fields are kept rather than dropped. Type `promote_model(stage: ModelStage | str)`.\n\n## Acceptance criteria\n- [ ] `PipelineRun.model_validate` on a payload with `status=\"brand-new-state\"` succeeds and keeps the raw value. This is tested.\n- [ ] `run.steps[0].name` and `run.logs[0].message` are typed attributes. This is tested.\n- [ ] Unknown extra response fields are accessible on the model. This is tested.\n- [ ] Enums are exported from `mlaiops_sdk`."
+  },
+  {
+    "title": "Ship py.typed, expose lazy exports to type checkers, and gate on mypy",
+    "labels": [
+      "dx",
+      "P2",
+      "area:packaging"
+    ],
+    "body": "## Problem\nThe package contains no `py.typed` marker (`ls mlaiops_sdk/` shows only modules; `pyproject.toml:41-42` packages the directory as-is), so mypy and pyright treat the SDK as untyped despite the class docstring \"Typed client\" (`mlaiops_sdk/client.py:25`). `build_chat_model`, `AgentMemoryClient`, `trace_llm` and others are resolved through a module `__getattr__` (`mlaiops_sdk/__init__.py:49-68`), so `from mlaiops_sdk import build_chat_model` has type `Any` for type checkers. Ruff only selects `E4,E7,E9,F` and no type checker runs in CI (`pyproject.toml` `[tool.ruff.lint]`, `.github/workflows/ci.yml:10-13`).\n\n## Proposal\nAdd `mlaiops_sdk/py.typed`. Add an `if TYPE_CHECKING:` block in `__init__.py` that imports the lazy symbols for checkers only. Annotate untyped public functions (`get_langgraph_checkpointer`, `build_chat_model`, `MockChatModel`, `agent_factory`, `to_langchain_tool`). Add `mypy --strict` (or pyright strict) to CI and widen the ruff rule set with `UP`, `B` and `ANN` for public APIs.\n\n## Acceptance criteria\n- [ ] The built wheel contains `mlaiops_sdk/py.typed`. A CI step checks this with `unzip -l`.\n- [ ] `reveal_type(mlaiops_sdk.build_chat_model)` is not `Any` in a typing test file checked by mypy.\n- [ ] CI fails on new mypy strict errors in `mlaiops_sdk/`.\n- [ ] Importing `mlaiops_sdk` still does not import langchain. A test checks `sys.modules`."
+  },
+  {
+    "title": "Compare tool versions semantically in get_tool instead of lexicographically",
+    "labels": [
+      "bug",
+      "P2",
+      "area:tools"
+    ],
+    "body": "## Problem\n`get_tool` resolves \"latest\" with `max(matches, key=lambda definition: definition.version)` (`mlaiops_sdk/tools.py:74`). That is a plain string comparison, so `\"9\"` beats `\"10\"` and `\"1.9.0\"` beats `\"1.10.0\"`. `langchain_tools(names)` relies on this (`mlaiops_sdk/tools.py:92`), so an agent can silently bind an older tool implementation. The existing test only covers single-digit versions (`tests/test_tools_langchain.py:23`).\n\n## Proposal\nParse versions with `packaging.version.Version`, which is already a transitive dependency of the stack (or add it explicitly). Fall back to registration order for non-PEP 440 strings. Validate the version string in `register_tool` and raise `ValueError` on unparsable input.\n\n## Acceptance criteria\n- [ ] Registering `1.9.0` and `1.10.0` makes `get_tool(name)` return `1.10.0`. This is tested.\n- [ ] Registering `9` and `10` returns `10`. This is tested.\n- [ ] An invalid version such as `\"latest\"` is rejected at registration with a clear message. This is tested.\n- [ ] The `get_tool` docstring states the ordering rule."
+  },
+  {
+    "title": "Pass derived input_schema to LangChain tools and add publish_tool to the client",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:tools"
+    ],
+    "body": "## Problem\n`register_tool` derives a JSON schema for each tool (`mlaiops_sdk/tools.py:33-48`), but `to_langchain_tool` ignores it and lets LangChain re-infer arguments from the function (`mlaiops_sdk/tools.py:81-85`). The schema the platform registry sees can therefore differ from what the model is offered. To register the same tool with the gateway, users must also copy fields by hand into `client.register_tool(name, version, description, input_schema, tags=...)` (`mlaiops_sdk/client.py:311-331`).\n\n## Proposal\nBuild a pydantic `args_schema` from the stored `input_schema`, or build both from one pydantic model created in `register_tool`, and pass it to `StructuredTool.from_function`. Add `MLAIOpsClient.publish_tool(definition: ToolDefinition) -> Tool` and a `publish_registered_tools()` convenience that is idempotent on `(name, version)` conflicts.\n\n## Acceptance criteria\n- [ ] `to_langchain_tool(defn).args_schema.model_json_schema()` matches `defn.input_schema` for required and property names. This is tested.\n- [ ] `client.publish_tool(defn)` sends name, version, description, tags and input_schema. This is tested with MockTransport.\n- [ ] A 409 from the gateway on re-publish is treated as success by `publish_registered_tools`. This is tested."
+  },
+  {
+    "title": "Make trace_llm support async functions and record real duration and status",
+    "labels": [
+      "bug",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`trace_llm` always wraps with a synchronous `wrapped` (`mlaiops_sdk/tracing.py:129-165`). When applied to an `async def`, `function(*args, **kwargs)` returns a coroutine immediately (`mlaiops_sdk/tracing.py:138`). The `finally` block then records `status=\"succeeded\"` with a near-zero `duration_ms` before the body runs, exceptions raised inside the coroutine are never marked `failed`, and `MLAIOPS_TRACE_ID` is restored before the coroutine reads it. The agent runtime is async (`mlaiops_sdk/agent_adapters.py:62`), so traces in the console are wrong for the main use case. `tracing.py` has no tests.\n\n## Proposal\nDetect `inspect.iscoroutinefunction(function)` and return an `async def` wrapper that awaits the call inside the timing and status block. Do the same for async generators. Preserve the sync path.\n\n## Acceptance criteria\n- [ ] A test decorates an async function that sleeps 50 ms and asserts the recorded `duration_ms >= 50`, with `record_trace` patched.\n- [ ] An async function that raises records `status=\"failed\"` and re-raises. This is tested.\n- [ ] `inspect.iscoroutinefunction(trace_llm(\"p\")(async_fn))` is True. This is tested.\n- [ ] The sync behavior is unchanged and covered by an existing-behavior test."
+  },
+  {
+    "title": "Carry trace IDs in contextvars instead of mutating os.environ",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`trace_llm` stores the active trace id by writing `os.environ[\"MLAIOPS_TRACE_ID\"]` and restores it afterwards (`mlaiops_sdk/tracing.py:134-135`, `mlaiops_sdk/tracing.py:159-162`). `os.environ` is process-global, so concurrent requests in the FastAPI agent runtime (`runtime` extra, `pyproject.toml:25-29`) or in threads overwrite each other's trace id. Nested calls on different threads also restore the wrong previous value, and child processes inherit stale ids. Session and user ids are read from the environment in the same way (`mlaiops_sdk/tracing.py:146-148`).\n\n## Proposal\nAdd `contextvars.ContextVar`s for trace id, session id, user id and agent id, with a `trace_context(...)` context manager and getters. Have `trace_llm` and `LangfuseContext` set and reset them with tokens. Keep the env vars only as initial defaults, and add a documented `current_trace_id()` accessor.\n\n## Acceptance criteria\n- [ ] `trace_llm` no longer writes to `os.environ`. A test asserts that the environment is unchanged during the call.\n- [ ] Two concurrent `asyncio` tasks each observe their own trace id via `current_trace_id()`. This is tested.\n- [ ] Two threads running decorated functions record distinct trace ids. This is tested with patched `record_trace`.\n- [ ] Env-var defaults still apply when no context is set. This is tested."
+  },
+  {
+    "title": "Send trace summaries off the request path with a pooled background exporter",
+    "labels": [
+      "performance",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`record_trace` performs a synchronous `httpx.post(..., timeout=2)` on every decorated call and every `LangfuseContext` exit (`mlaiops_sdk/tracing.py:170-187`, called from `mlaiops_sdk/tracing.py:103` and `mlaiops_sdk/tracing.py:144`). Each call opens a new connection with no pooling. In async agents this blocks the event loop for up to 2 s per trace when the gateway is slow. Non-HTTP errors (for example invalid URL types) are not caught, despite the comment that tracing must never break execution (`mlaiops_sdk/tracing.py:186`).\n\n## Proposal\nAdd a `TraceExporter` with a bounded in-memory queue and a daemon worker that batches summaries over a shared `httpx.Client`. Drop and count events when the queue is full, and flush at `atexit` and on an explicit `flush()`. `record_trace` enqueues and returns immediately. Catch `Exception` around export so tracing can never raise into user code.\n\n## Acceptance criteria\n- [ ] With a gateway that sleeps 2 s, a decorated function's wall time adds under 5 ms. A test uses MockTransport with a delay.\n- [ ] 100 traces reuse one client and connection pool. A test asserts a single client instance.\n- [ ] A full queue drops events without raising and increments a counter exposed by the exporter. This is tested.\n- [ ] `flush()` delivers pending traces before returning. This is tested."
+  },
+  {
+    "title": "Report real token usage from LangfuseContext instead of hardcoded zeros",
+    "labels": [
+      "observability",
+      "P3",
+      "area:tracing"
+    ],
+    "body": "## Problem\nThe tracing module promises that \"token usage, and cost stay visible in the console even without Langfuse\" (`mlaiops_sdk/tracing.py:4-6`). Both emitters send `\"input_tokens\": 0, \"output_tokens\": 0, \"cost_usd\": 0` unconditionally (`mlaiops_sdk/tracing.py:112-114`, `mlaiops_sdk/tracing.py:153-155`). The data is available: LangChain `AIMessage.usage_metadata` is populated by real providers, by `MockChatModel` (`mlaiops_sdk/llm.py:134-148`), and by `CallableAdapter` (`mlaiops_sdk/agent_adapters.py:86-88`). `AgentSession` already has `input_tokens`/`output_tokens`/`cost_usd` fields (`mlaiops_sdk/models.py:195-197`) that stay at zero.\n\n## Proposal\nAdd a lightweight LangChain callback handler to `LangfuseContext.callbacks` and `langgraph_config` that sums `usage_metadata` from `on_llm_end`. Add `ctx.add_usage(input_tokens, output_tokens, cost_usd)` for non-LangChain frameworks. Include the totals in the `__exit__` summary.\n\n## Acceptance criteria\n- [ ] Running `MockChatModel` twice inside `LangfuseContext` with its callbacks records non-zero `input_tokens` and `output_tokens` that match the sum of `usage_metadata`. This is tested with patched `record_trace`.\n- [ ] `ctx.add_usage` totals appear in the emitted payload. This is tested.\n- [ ] The callbacks still work when Langfuse is not configured (handler is None). This is tested."
+  },
+  {
+    "title": "Add stdlib logging and stop swallowing tracing and Langfuse failures silently",
+    "labels": [
+      "observability",
+      "P3",
+      "area:client"
+    ],
+    "body": "## Problem\nNo module in `mlaiops_sdk/` uses `logging` (`grep -rn logging mlaiops_sdk` is empty). Failures are discarded with no trace: `langfuse_handler` returns None on any exception (`mlaiops_sdk/tracing.py:38-41`), `score` and `flush` errors are swallowed with `except Exception: pass` (`mlaiops_sdk/tracing.py:94-95`, `mlaiops_sdk/tracing.py:122-123`), and gateway trace delivery errors are dropped (`mlaiops_sdk/tracing.py:185-187`). A misconfigured `LANGFUSE_HOST` or an expired token produces no signal. The client has no request logging hook for debugging gateway calls either.\n\n## Proposal\nCreate `logging.getLogger(\"mlaiops_sdk\")` and child loggers per module, with a `NullHandler` by default. Log swallowed tracing errors at WARNING, once per distinct error, to avoid flooding. Log request method, path, status and duration at DEBUG through httpx event hooks, never logging headers or bodies. Support `MLAIOPS_LOG=debug` for quick enablement.\n\n## Acceptance criteria\n- [ ] A Langfuse `CallbackHandler` that raises produces one WARNING on `mlaiops_sdk.tracing`. This is tested with `caplog`.\n- [ ] DEBUG request logs include method, path and status but no `Authorization` value. A test asserts that the token string is absent from `caplog.text`.\n- [ ] Importing the package adds no handlers to the root logger. This is tested."
+  },
+  {
+    "title": "Scope agent memory recall by user and session to prevent cross-user leakage",
+    "labels": [
+      "security",
+      "P1",
+      "area:agents"
+    ],
+    "body": "## Problem\n`AgentMemoryClient` stores `agent_name` and `session_id` (`mlaiops_sdk/agents.py:159-166`) but has no user or tenant dimension. `recall` filters only `WHERE agent_name = %s` (`mlaiops_sdk/agents.py:174-178`). A deployed agent serving many users returns user A's remembered facts to user B, and `session_id` is written but never used as a filter. The adapter docs require persistence to be \"scope[d] by authenticated tenant/user/session\" (`mlaiops_sdk/agent_adapters.py:54`), and the platform's own memory client does not meet that requirement.\n\n## Proposal\nAdd a required `user_id` (and optional `tenant_id`) to `AgentMemoryClient`, add the matching columns plus a composite index through an idempotent migration in `_ensure_schema`, and filter `recall` by `agent_name` and `user_id` by default. Add `scope=\"session\"|\"user\"|\"agent\"`, where agent-wide recall is an explicit opt-in. Add `forget(...)` for deletion requests.\n\n## Acceptance criteria\n- [ ] With the pgvector CI job, a memory stored for user A is not returned to user B. A test is added next to `tests/test_agents.py:66`.\n- [ ] `scope=\"session\"` returns only the current session's memories. This is tested.\n- [ ] `_ensure_schema` upgrades an existing table without data loss. A test creates the old schema first.\n- [ ] `forget(user_id=...)` deletes that user's rows. This is tested."
+  },
+  {
+    "title": "Validate embedder dimension against the fixed vector(256) memory column",
+    "labels": [
+      "bug",
+      "P2",
+      "area:agents"
+    ],
+    "body": "## Problem\nThe memory table is created with `embedding vector({EMBEDDING_DIM})`, where `EMBEDDING_DIM = 256` (`mlaiops_sdk/agents.py:21`, `mlaiops_sdk/agents.py:140`). The docs encourage swapping in a provider embedder through `AgentMemoryClient(embedder=...)` (`mlaiops_sdk/agents.py:67-68`, `mlaiops_sdk/agents.py:104`), and `HashingEmbedder` takes any `dim` (`mlaiops_sdk/agents.py:71`). A 1536-dim OpenAI embedder fails at the first `remember` with a pgvector dimension error. If the table already exists, `CREATE TABLE IF NOT EXISTS` silently keeps the old dimension. The embedder is typed `Any`.\n\n## Proposal\nDefine an `Embedder` Protocol with `dim: int` and `embed(text) -> list[float]`. Create the column using the embedder's dimension, or use a per-dimension table name. On connect, compare the existing column's `atttypmod` with `embedder.dim` and raise `MissingConfiguration` with a clear message on mismatch. Optionally add `aembed` for async providers.\n\n## Acceptance criteria\n- [ ] `AgentMemoryClient(embedder=HashingEmbedder(dim=64))` against a fresh database stores and recalls successfully. This is tested in the pgvector CI job.\n- [ ] Connecting with a 64-dim embedder to an existing 256-dim table raises a descriptive error before any insert. This is tested.\n- [ ] The `Embedder` Protocol is exported and used in the `embedder` annotation."
+  },
+  {
+    "title": "Add an async AgentMemoryClient and authenticate feature gateway lookups",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:agents"
+    ],
+    "body": "## Problem\n`AgentMemoryClient` uses synchronous `psycopg.connect` (`mlaiops_sdk/agents.py:125`) and a module-level `httpx.post` per feature lookup (`mlaiops_sdk/agents.py:194-200`). Agents run as async LangGraph graphs with `AsyncPostgresSaver` (`mlaiops_sdk/agents.py:44-60`), so `remember`/`recall` block the event loop on every node. `get_entity_features` opens a new connection per call, sends no Authorization header, and raises raw `httpx.HTTPStatusError`.\n\n## Proposal\nAdd `AsyncAgentMemoryClient` that uses `psycopg.AsyncConnection` (or an `AsyncConnectionPool`) and `httpx.AsyncClient`, with `aremember`, `arecall` and `aget_entity_features`. Reuse one HTTP client per memory client. Accept a token or `httpx.Auth` for the feature gateway (default `MLAIOPS_TOKEN`). Map errors to the SDK exception hierarchy.\n\n## Acceptance criteria\n- [ ] The async memory round trip passes in the pgvector CI job.\n- [ ] Two `get_entity_features` calls reuse one HTTP client. This is tested with MockTransport.\n- [ ] When a token is configured, the feature gateway request carries `Authorization`. This is tested.\n- [ ] The README agents section shows the async usage."
+  },
+  {
+    "title": "Add contract tests that validate client calls against the platform OpenAPI spec",
+    "labels": [
+      "testing",
+      "P2",
+      "area:testing"
+    ],
+    "body": "## Problem\nClient tests use hand-written MockTransport handlers that echo whatever the test author assumed the gateway returns (`tests/test_client.py:18-112`, `tests/test_client_workflows.py:8-25`). Drift is already visible: `list_projects` expects a bare list (`mlaiops_sdk/client.py:62`) while most list endpoints use `{items,total}` (`mlaiops_sdk/client.py:357-358`). Request bodies such as `deploy_agent`'s `autoscaling`/`resources` (`mlaiops_sdk/client.py:243-266`) and response models such as required `Agent.canary_weight` (`mlaiops_sdk/models.py:146`) are never checked against the gateway's schema, so a platform change only breaks users at runtime.\n\n## Proposal\nVendor the platform OpenAPI document at a pinned platform version under `tests/contract/openapi.json`, with a script to refresh it. Add a MockTransport that validates every outgoing request (path, method, query, body) against the spec and serves responses generated from the response schemas (for example with `schemathesis` or `openapi-core`). Then round-trip each response through the SDK models. Run a scheduled CI job against the platform's latest spec that opens an issue on drift.\n\n## Acceptance criteria\n- [ ] Every public `MLAIOpsClient` method has a contract test. A meta-test fails if a method lacks one.\n- [ ] A request field missing from the spec fails the test with the offending path.\n- [ ] Every SDK response model validates the spec's example or generated responses for its endpoint.\n- [ ] A nightly workflow runs the suite against the latest platform spec."
+  },
+  {
+    "title": "Cover tracing, agent adapters, and untested client methods; enforce a coverage floor",
+    "labels": [
+      "testing",
+      "P2",
+      "area:testing"
+    ],
+    "body": "## Problem\nThere is no test file for `mlaiops_sdk/tracing.py` or `mlaiops_sdk/agent_adapters.py` (the test list in `tests/` covers agents, client, client_workflows, huggingface, llm, primitives and tools_langchain only). In the client, `invoke_agent`, `set_agent_traffic`, `agent_sessions`, `agent_traces`, `cancel_pipeline_run`, `retry_pipeline_run`, `promote_model`, `deploy_model`, `rollback_model`, `create_connection`, `test_connection`, `readiness` and `audit_events` (`mlaiops_sdk/client.py:123-131`, `mlaiops_sdk/client.py:204-221`, `mlaiops_sdk/client.py:269-355`) are never exercised. CI does not measure coverage (`.github/workflows/ci.yml:10-13`).\n\n## Proposal\nAdd `tests/test_tracing.py` (Langfuse absent and present, `record_trace` with and without `MLAIOPS_URL`, score and flush failures), `tests/test_agent_adapters.py` (sync and async run, token validation at `mlaiops_sdk/agent_adapters.py:80-87`, `AgnoAdapter` with dict and object metrics, `NooaAdapter` rejecting private and sync methods), and MockTransport tests for each listed client method. Add `pytest-cov` with `--cov-fail-under` at 85 and raise it over time.\n\n## Acceptance criteria\n- [ ] `tests/test_tracing.py` and `tests/test_agent_adapters.py` exist and pass without network access.\n- [ ] Each listed client method has at least one test that asserts the HTTP method, path and body.\n- [ ] CI fails when total line coverage drops below the configured floor.\n- [ ] The coverage report is uploaded as a CI artifact."
+  },
+  {
+    "title": "Publish to PyPI via trusted publishing with signed provenance attestations",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:release"
+    ],
+    "body": "## Problem\nThe SDK is installed from GitHub archive tarballs (`README.md:37-42`). The release job only runs `gh release create` with the built `dist/*` (`.github/workflows/ci.yml:24-28`). Users cannot `pip install mlaiops-sdk`, resolvers cannot pick compatible versions, and the artifacts have no provenance attestation. The tarball install path also builds from the raw source archive, not the CI-built wheel. `pyproject.toml:5-10` lacks `readme`, `license`, `authors` and `classifiers`, so a PyPI page would be blank.\n\n## Proposal\nAdd a `publish` job on `v*` tags that downloads the `dist` artifact and uses `pypa/gh-action-pypi-publish` with OIDC trusted publishing (`permissions: id-token: write`, a protected `pypi` environment) and no stored API token. Publish to TestPyPI first from pre-release tags. Generate attestations with `actions/attest-build-provenance`. Fill in the project metadata (`readme = \"README.md\"`, `license = \"MIT\"`, classifiers, `Changelog` URL). Update the README install instructions.\n\n## Acceptance criteria\n- [ ] A tag `vX.Y.ZrcN` publishes to TestPyPI and `pip install -i https://test.pypi.org/simple mlaiops-sdk==X.Y.ZrcN` works.\n- [ ] No PyPI token secret exists in the repository. Publishing uses OIDC only.\n- [ ] `twine check dist/*` runs in CI and passes.\n- [ ] The README install section shows `pip install mlaiops-sdk` and `pip install \"mlaiops-sdk[agents]\"`."
+  },
+  {
+    "title": "Pin reusable workflows and third-party actions to commit SHAs",
+    "labels": [
+      "security",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\nThe main test job calls `kiongahq/.github/.github/workflows/python.yml@main` (`.github/workflows/ci.yml:11`). Any push to that repository's `main` changes what runs in this repository's CI, including on tag builds that create releases. The `package` job runs with `contents: write` (`.github/workflows/ci.yml:28`) and uses tag-pinned actions (`actions/checkout@v4`, `actions/setup-python@v5`, `actions/upload-artifact@v4` at `.github/workflows/ci.yml:18-23`), which can be moved. Once PyPI publishing is added, this becomes a supply-chain path into the published package.\n\n## Proposal\nPin the reusable workflow and every action to a full commit SHA with a version comment. Enable Dependabot for `github-actions` to bump the SHAs. Set top-level `permissions: contents: read` and grant `contents: write` only to the release step's job. Add `zizmor` or `actionlint` to CI.\n\n## Acceptance criteria\n- [ ] Every `uses:` in `.github/workflows/*.yml` references a 40-char SHA. A CI lint step fails otherwise.\n- [ ] Top-level workflow permissions are read-only.\n- [ ] `.github/dependabot.yml` covers `github-actions` and `pip`.\n- [ ] `zizmor` or `actionlint` runs on pull requests with zero findings."
+  },
+  {
+    "title": "Test the supported Python matrix and lowest declared dependency versions",
+    "labels": [
+      "testing",
+      "P3",
+      "area:packaging"
+    ],
+    "body": "## Problem\n`requires-python = \">=3.11\"` (`pyproject.toml:9`) claims support for 3.11 through 3.14, but the package and pgvector jobs pin `python-version: \"3.11\"` (`.github/workflows/ci.yml:20`, `.github/workflows/ci.yml:46`) and the main job delegates to an external workflow whose matrix is not visible here (`.github/workflows/ci.yml:11`). Lower bounds such as `httpx>=0.27`, `pydantic>=2.7`, `langgraph>=0.2` and `langfuse>=2.0` (`pyproject.toml:10`, `pyproject.toml:17-22`) are never tested, even though `tracing.py` has explicit langfuse v2 and v3 branches (`mlaiops_sdk/tracing.py:31-37`).\n\n## Proposal\nAdd a matrix over 3.11, 3.12, 3.13 and 3.14, plus a `lowest-direct` job that installs with `uv pip install --resolution lowest-direct`. Add a job that pins `langfuse<3` to exercise the v2 import path. Declare `Programming Language :: Python :: 3.x` classifiers that match the matrix. Document the support policy (for example, supported until upstream EOL).\n\n## Acceptance criteria\n- [ ] CI runs the unit tests on every Python version in the declared classifiers.\n- [ ] A `lowest-direct` resolution job passes, or the failing lower bounds are raised in `pyproject.toml`.\n- [ ] A langfuse 2.x job passes the tracing tests.\n- [ ] The README states the Python support policy."
+  },
+  {
+    "title": "Add CHANGELOG, runtime __version__, and an SDK User-Agent header",
+    "labels": [
+      "docs",
+      "P2",
+      "area:release"
+    ],
+    "body": "## Problem\nThe version exists only as a literal in `pyproject.toml:7`. There is no `__version__` in `mlaiops_sdk/__init__.py` and no CHANGELOG file in the repository. Release notes come from `--generate-notes` (`.github/workflows/ci.yml:27`), which lists PR titles rather than user-facing changes. The client sends no `User-Agent` identifying the SDK version (`mlaiops_sdk/client.py:39-47`), so the gateway cannot tell which SDK versions are calling deprecated endpoints. The release rule in `README.md:61-62` depends on a human keeping the tag and the file in sync.\n\n## Proposal\nAdd `CHANGELOG.md` in Keep a Changelog format with an `Unreleased` section, and require an entry via a PR check unless a `skip-changelog` label is present. Expose `mlaiops_sdk.__version__` via `importlib.metadata.version(\"mlaiops-sdk\")`. Send `User-Agent: mlaiops-sdk-python/<version> python/<x.y> httpx/<v>`. Add a CI step that fails a tag build when the tag does not equal `v` plus the `pyproject.toml` version. Document the SemVer policy for 0.x releases.\n\n## Acceptance criteria\n- [ ] `mlaiops_sdk.__version__` equals the installed distribution version. This is tested.\n- [ ] Every request carries the SDK `User-Agent`. This is tested with MockTransport.\n- [ ] A tag that does not match the version fails CI before the release is created.\n- [ ] `CHANGELOG.md` exists with entries for 0.2.0 and Unreleased."
+  },
+  {
+    "title": "Define a deprecation policy and emit DeprecationWarning for legacy aliases",
+    "labels": [
+      "docs",
+      "P3",
+      "area:release"
+    ],
+    "body": "## Problem\n`tracing.py` keeps `_record_trace = record_trace` as a \"Backwards-compatible private alias (pre-1.0 callers)\" (`mlaiops_sdk/tracing.py:190-191`), but nothing warns the callers or says when it will be removed. As endpoints, parameters (for example `invoke_function_async` vs a future async client at `mlaiops_sdk/client.py:158`) and enum-typed fields change, users have no documented guarantee about how long old names keep working or how they will be told.\n\n## Proposal\nAdd a `DEPRECATION.md` (or a README section) that states: deprecations are announced in the CHANGELOG, emit `DeprecationWarning` (or `FutureWarning` for user-facing behavior) for at least two minor releases or 90 days, and are removed only in a minor release while on 0.x and a major release after 1.0. Add a `mlaiops_sdk._deprecation.deprecated(since, removed_in, alternative)` helper and use it for `_record_trace`. Run tests with `-W error::DeprecationWarning` for SDK-internal code.\n\n## Acceptance criteria\n- [ ] Calling `_record_trace` emits a `DeprecationWarning` naming `record_trace` and the removal version. This is tested with `pytest.warns`.\n- [ ] The policy document is linked from the README.\n- [ ] pytest config turns `DeprecationWarning`s raised from `mlaiops_sdk` internals into errors.\n- [ ] The CHANGELOG has a `Deprecated` section template."
+  },
+  {
+    "title": "Split the agents extra by provider and bound major versions of fast-moving deps",
+    "labels": [
+      "refactor",
+      "P3",
+      "area:packaging"
+    ],
+    "body": "## Problem\nThe `agents` extra installs both `langchain-openai` and `langchain-anthropic`, plus `langfuse` and `psycopg[binary]` (`pyproject.toml:16-24`), even though `build_chat_model` imports each provider lazily (`mlaiops_sdk/llm.py:51-66`). A user who only needs the mock backend or one provider pulls everything. None of these entries has an upper bound (`langgraph>=0.2`, `langfuse>=2.0`), while `agno`, `nooa` and `huggingface` do (`pyproject.toml:13-15`). A future `langgraph` 2.x or `langfuse` 4.x will break installs without a release from this repository. `psycopg[binary]` is also inappropriate for some production images.\n\n## Proposal\nAdd granular extras: `openai`, `anthropic`, `tracing` (langfuse), `memory` (psycopg, langgraph-checkpoint-postgres), and `langgraph`. Keep `agents` as an aggregate for compatibility. Add `<next-major` upper bounds on the fast-moving deps. Let `memory` use plain `psycopg` and document `psycopg[binary]` or `psycopg[c]` as the user's choice. Update the import-guard messages in `llm.py` and `agents.py` to name the precise extra.\n\n## Acceptance criteria\n- [ ] `pip install \"mlaiops-sdk[anthropic]\"` followed by `build_chat_model(\"anthropic\")` works without langchain-openai installed. A CI job checks this.\n- [ ] Every third-party dependency in an extra has an upper bound.\n- [ ] The `ImportError` messages name the matching extra. This is tested by simulating a missing module.\n- [ ] The README extras table is updated."
+  },
+  {
+    "title": "Write docstrings for all public client methods and publish an API reference",
+    "labels": [
+      "docs",
+      "P2",
+      "area:docs"
+    ],
+    "body": "## Problem\nOnly 2 of the roughly 40 public `MLAIOpsClient` methods have docstrings (`import_huggingface_model` at `mlaiops_sdk/client.py:174` and `invoke_agent` at `mlaiops_sdk/client.py:278`). Methods with non-obvious semantics are undocumented, for example `deploy_agent` mapping `replicas`/`max_replicas` into autoscaling (`mlaiops_sdk/client.py:226-267`), the meaning and valid range of `canary_weight` (`mlaiops_sdk/client.py:209`, `mlaiops_sdk/client.py:287`), and `invoke_function` vs `invoke_function_async` (`mlaiops_sdk/client.py:155-159`). The pydantic models in `mlaiops_sdk/models.py` have no field descriptions. `examples/` contains only `quickstart.py`.\n\n## Proposal\nAdd Google-style docstrings (Args, Returns, Raises) to every public symbol. Add `Field(description=...)` on model fields. Generate an API reference with mkdocstrings (or pdoc) in CI and publish it to the docs site linked at `pyproject.toml:38`. Add runnable examples for agents with memory and tools, pipeline definition from `Pipeline`, model promotion and rollback, and Hugging Face import and download. Enable ruff `D` rules for `mlaiops_sdk/`.\n\n## Acceptance criteria\n- [ ] Ruff `D1xx` rules pass for `mlaiops_sdk/`.\n- [ ] The API reference builds in CI with warnings treated as errors.\n- [ ] At least 4 new scripts in `examples/` run under CI against MockTransport or the mock LLM backend.\n- [ ] Each `canary_weight` parameter documents its unit and range."
+  },
+  {
+    "title": "Accept Pipeline objects in the client and validate inputs before sending",
+    "labels": [
+      "dx",
+      "P3",
+      "area:pipelines"
+    ],
+    "body": "## Problem\n`Pipeline.definition()` returns a plain dict (`mlaiops_sdk/pipelines.py:60-93`), but `create_pipeline_definition` takes positional `project_id, name, version, jobs: list[dict]` (`mlaiops_sdk/client.py:144-146`), so users must unpack the dict by hand. `Pipeline.compile()` emits steps without the `kind` field that `definition()` adds (`mlaiops_sdk/pipelines.py:57` vs `mlaiops_sdk/pipelines.py:79-82`), producing two inconsistent shapes from one object. Obvious invalid inputs reach the gateway: `deploy_agent` accepts `max_replicas < replicas` (`mlaiops_sdk/client.py:256`) and `canary_weight` has no 0 to 100 check (`mlaiops_sdk/client.py:209`, `mlaiops_sdk/client.py:287`).\n\n## Proposal\nAdd `client.create_pipeline_definition_from(pipeline: Pipeline, project_id, *, version=\"1\", ...)`. Make `compile()` include `kind`, or document why it differs. Convert the step dataclasses to pydantic models so `definition()` returns a typed `PipelineDefinitionCreate`. Validate `canary_weight` in range and `max_replicas >= replicas` client-side, raising `ValueError`.\n\n## Acceptance criteria\n- [ ] `client.create_pipeline_definition_from(p, \"prj-1\")` sends the same body as `p.definition(\"prj-1\")`. This is tested.\n- [ ] Every step in `compile()` output carries `kind`. This is tested.\n- [ ] `deploy_agent(..., replicas=3, max_replicas=1)` and `deploy_model(id, canary_weight=150)` raise `ValueError` without a request. This is tested with a MockTransport that fails on any call."
+  },
+  {
+    "title": "Report correct total_tokens in MockChatModel usage metadata",
+    "labels": [
+      "bug",
+      "P3",
+      "area:llm"
+    ],
+    "body": "## Problem\n`MockChatModel` sets `\"total_tokens\": 0` in both branches (`mlaiops_sdk/llm.py:137` and `mlaiops_sdk/llm.py:147`), even though `input_tokens` and `output_tokens` are non-zero. Gate tests that check cost or usage accounting with the mock backend (the stated purpose at `mlaiops_sdk/llm.py:88-96`) see inconsistent usage, and code that reads `total_tokens`, such as LangChain usage callbacks and Langfuse, records zero. `CallableAdapter` computes the total correctly (`mlaiops_sdk/agent_adapters.py:86-87`), so the two paths disagree.\n\n## Proposal\nSet `total_tokens = input_tokens + output_tokens` in both branches. Count tool-call output tokens from the serialized args instead of a fixed `1` (`mlaiops_sdk/llm.py:136`).\n\n## Acceptance criteria\n- [ ] For a text reply, `usage_metadata[\"total_tokens\"] == input_tokens + output_tokens`. A test is added in `tests/test_llm.py`.\n- [ ] The same holds for a scripted tool-call reply. This is tested.\n- [ ] Tool-call `output_tokens` reflects the args length deterministically. This is tested."
+  },
+  {
+    "title": "Document and test thread and async safety of clients and the tool registry",
+    "labels": [
+      "reliability",
+      "P3",
+      "area:client"
+    ],
+    "body": "## Problem\nUsers share one client across notebook threads, FastAPI workers and agent tasks, but the SDK makes no statement about which objects are safe to share. `register_tool` mutates the module-global `_registry` dict with a check-then-insert sequence (`mlaiops_sdk/tools.py:21`, `mlaiops_sdk/tools.py:51-54`) that can race on concurrent imports. `AgentMemoryClient` lazily creates a single shared `psycopg` connection with no lock (`mlaiops_sdk/agents.py:115-127`), so two threads can each open a connection and leak one. `MockChatModel` increments `calls` without synchronization (`mlaiops_sdk/llm.py:120`). The tool registry cannot be reset between tests or scoped per agent.\n\n## Proposal\nAdd a \"Concurrency\" section to the docs stating that `MLAIOpsClient` is thread-safe (httpx.Client is), `AsyncMLAIOpsClient` must stay on one event loop, and `AgentMemoryClient` is one instance per thread unless pooled. Guard `_registry` mutations and `AgentMemoryClient._connect` with `threading.Lock`. Introduce a `ToolRegistry` class with a default instance, plus `clear()` for tests.\n\n## Acceptance criteria\n- [ ] A test registering 100 distinct tools from 16 threads ends with exactly 100 entries and no exceptions.\n- [ ] A test calling `_connect` from 8 threads with a patched `psycopg.connect` asserts exactly one connection is created.\n- [ ] `ToolRegistry().clear()` exists and is used in `tests/test_tools_langchain.py` fixtures.\n- [ ] The concurrency guarantees are documented in the README or the docs site."
+  }
+]

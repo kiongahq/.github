@@ -1,0 +1,308 @@
+[
+  {
+    "title": "Restore SSE flushing by making statusRecorder expose Flush and Unwrap",
+    "labels": [
+      "bug",
+      "P1",
+      "area:proxy"
+    ],
+    "body": "## Problem\nThe handler wraps the client writer in `statusRecorder` (`internal/traceproxy/proxy.go:89-90`). `statusRecorder` (`internal/traceproxy/proxy.go:96-104`) embeds the `http.ResponseWriter` interface, which promotes only `Header`, `Write` and `WriteHeader`. It does not implement `http.Flusher` or `Unwrap() http.ResponseWriter`.\n\n`httputil.ReverseProxy` detects `text/event-stream` and flushes after each write through `http.NewResponseController(dst).Flush` (Go stdlib `net/http/httputil/reverseproxy.go:684` and `:702`). Because `statusRecorder` exposes neither method, that call returns `ErrNotSupported` and is ignored. SSE chunks for `stream: true` chat completions then sit in the server's write buffer and reach clients in large bursts, or only when the stream ends. This breaks token-by-token streaming for every OpenAI-compatible client.\n\n## Proposal\n- Add `func (w *statusRecorder) Unwrap() http.ResponseWriter { return w.ResponseWriter }` so `http.ResponseController` reaches the real writer.\n- Add an explicit `Flush()` that delegates when the underlying writer supports it.\n- Record that a header was written in `Write` too: an implicit 200 currently works only because the default is 200.\n\n## Acceptance criteria\n- [ ] `http.NewResponseController(recorder).Flush()` returns nil when the recorder wraps an `httptest.ResponseRecorder` or a real server writer.\n- [ ] New test `TestProxyStreamsSSEIncrementally`: a fake upstream writes `data:` lines 200ms apart and flushes each one. The client gets the first event before the upstream writes the second.\n- [ ] Test passes under `go test -race ./...`.\n- [ ] The trace event still records the upstream status for streamed responses."
+  },
+  {
+    "title": "Inject the upstream API key server-side and strip client Authorization headers",
+    "labels": [
+      "security",
+      "P1",
+      "area:security"
+    ],
+    "body": "## Problem\n`README.md:6-7` says provider keys \"stay in the proxy's environment and never appear in traces or logs\". The code does not do that:\n- `LLM_UPSTREAM_API_KEY` is listed as a secret in `internal/runtimeconfig/config.go:17` and loaded from `_FILE`, but nothing reads it (`grep` finds no use in `cmd/` or `internal/traceproxy/`).\n- The Director (`internal/traceproxy/proxy.go:77-81`) only adds `X-MLAIOps-Agent*` headers. Every inbound header, including `Authorization`, `api-key` and `x-api-key`, goes to the upstream unchanged.\n\nSo every agent must hold the real provider key to call a hosted upstream. That defeats the egress design: any compromised agent leaks the provider credential.\n\n## Proposal\n- In the Director (or a `Rewrite` func), delete inbound `Authorization`, `Api-Key`, `X-Api-Key` and `Proxy-Authorization`.\n- When `LLM_UPSTREAM_API_KEY` is set, set `Authorization: Bearer <key>` on the outbound request. Make the header name and scheme configurable per upstream, because Anthropic uses `x-api-key` and Azure uses `api-key`.\n- Do not ship key injection until inbound client auth exists (see the per-project API key issue). Without it, the proxy becomes an open relay for the provider key.\n\n## Acceptance criteria\n- [ ] Test: a client sends `Authorization: Bearer client-secret`, and the fake upstream sees `Bearer <LLM_UPSTREAM_API_KEY>` and never `client-secret`.\n- [ ] Test: `X-Api-Key` and `Api-Key` from the client are absent upstream.\n- [ ] With no `LLM_UPSTREAM_API_KEY` set, behavior is documented and covered by a test (passthrough disabled or explicit opt-in flag).\n- [ ] The README configuration table lists `LLM_UPSTREAM_API_KEY` and `LLM_UPSTREAM_API_KEY_FILE`."
+  },
+  {
+    "title": "Require per-project API keys on inbound requests and attach project to traces",
+    "labels": [
+      "security",
+      "P1",
+      "area:security"
+    ],
+    "body": "## Problem\nThe handler (`internal/traceproxy/proxy.go:82-93`) serves any request on any path with no authentication. Agent identity comes only from process env (`cmd/trace-proxy/main.go:28`) and `Event` has no project or key field (`internal/traceproxy/proxy.go:13-21`). Anyone who can reach the port can spend upstream capacity. Once the upstream key is injected server-side, that becomes direct spend on a proprietary provider. Traces also cannot be attributed to a project.\n\n## Proposal\n- Add a key store loaded from a mounted file (for example `TRACE_PROXY_KEYS_FILE`, JSON of `{key_sha256, project, agent, allowed_models}`). Only hashes are stored, and keys are compared in constant time.\n- Authenticate `Authorization: Bearer` and `x-api-key` before proxying. Reject with an OpenAI-shaped 401 error body.\n- Add `project` and `key_id` (never the key itself) to `Event`.\n- Keep `/healthz` unauthenticated.\n\n## Acceptance criteria\n- [ ] A request with no key or an unknown key gets 401 with `{\"error\":{\"type\":\"invalid_api_key\",...}}`, and the fake upstream gets no request.\n- [ ] A valid key proxies and the emitted `Event` has the matching `project` and `key_id`.\n- [ ] A test asserts the raw key never appears in the marshalled `Event` JSON.\n- [ ] The key file is listed in `SecretNames`-style `_FILE` handling and documented in the README."
+  },
+  {
+    "title": "Raise streaming timeouts so long SSE completions are not cut off at 120s",
+    "labels": [
+      "bug",
+      "P2",
+      "area:proxy"
+    ],
+    "body": "## Problem\n`cmd/trace-proxy/main.go:29` sets `WriteTimeout: 120 * time.Second` and `ReadTimeout: 120 * time.Second` on the server. `WriteTimeout` is an absolute deadline from the end of header read. A streamed completion from a slow self-hosted vLLM or llama.cpp model, or a long reasoning-model response, that runs past 120s gets its connection closed mid-stream. The client sees a truncated SSE body with no `[DONE]`, and the trace records status 200 (`proxy.go:91`).\n\n## Proposal\n- Leave server `WriteTimeout` at 0 and enforce per-request limits instead: use `http.NewResponseController(w).SetWriteDeadline` and extend it on each flushed chunk (an idle timeout between chunks), plus a configurable max total duration (`LLM_STREAM_MAX_DURATION`, default 10m).\n- Make `ReadTimeout` configurable for large prompt uploads.\n- Mark the event as `truncated: true` when the deadline fires.\n\n## Acceptance criteria\n- [ ] Test: a fake upstream streams one event per second for longer than a configured short `WriteTimeout`, and the client receives all events plus `[DONE]`.\n- [ ] Test: an upstream that stalls for longer than the idle timeout is cut off, and the event has `truncated: true`.\n- [ ] New env vars are documented in the README table."
+  },
+  {
+    "title": "Rewrite Host header and define base-path joining for hosted upstreams",
+    "labels": [
+      "bug",
+      "P2",
+      "area:proxy"
+    ],
+    "body": "## Problem\n`httputil.NewSingleHostReverseProxy` (`internal/traceproxy/proxy.go:75`) rewrites `req.URL.Host` but leaves `req.Host` as the client's value (for example `trace-proxy:8081`). Hosted providers behind CDNs (`api.openai.com`, Azure endpoints) route on Host/SNI and can reject or misroute these requests.\n\nThe default path join also means `LLM_UPSTREAM_URL=https://api.openai.com/v1` plus a client path `/v1/chat/completions` produces `/v1/v1/chat/completions`. Neither behavior is documented (`README.md:22`).\n\n## Proposal\n- Switch from `Director` to `ReverseProxy.Rewrite` using `pr.SetURL(upstream)`, which sets `Out.Host`.\n- Document that `LLM_UPSTREAM_URL` is the origin without `/v1`, or detect a trailing `/v1` and strip the duplicate segment.\n\n## Acceptance criteria\n- [ ] Test: the fake upstream sees `r.Host == upstream host`.\n- [ ] Test: with `LLM_UPSTREAM_URL` ending in `/v1`, the upstream receives `/v1/chat/completions` exactly once.\n- [ ] README explains the base URL format with one vLLM and one OpenAI example."
+  },
+  {
+    "title": "Stop forwarding X-Forwarded-* and internal headers to upstream providers",
+    "labels": [
+      "security",
+      "P2",
+      "area:security"
+    ],
+    "body": "## Problem\nWith a `Director` func (`internal/traceproxy/proxy.go:77-81`), `ReverseProxy` keeps any inbound `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` and appends the client IP. Internal pod IPs, cluster hostnames and client-supplied spoofed values all reach a third-party provider. Inbound `X-Session-ID`, `Cookie` and any `X-MLAIOps-*` headers a client sets also pass through. The proxy then overwrites only the two agent headers.\n\n## Proposal\n- Use `Rewrite`, which does not set `X-Forwarded-*` by default.\n- Add an outbound header allowlist per upstream: `Content-Type`, `Accept`, `OpenAI-Organization`, `anthropic-version` and similar. Optionally send `X-MLAIOps-*` only to upstreams marked `internal: true`.\n- Strip `Cookie` unconditionally.\n\n## Acceptance criteria\n- [ ] Test: a client sends `X-Forwarded-For: 1.2.3.4` and `Cookie: a=b`, and the fake upstream sees neither.\n- [ ] Test: for an upstream marked external, the `X-MLAIOps-Agent` header is absent.\n- [ ] The allowlist is documented."
+  },
+  {
+    "title": "Populate Event.Model from the request body with a bounded peek",
+    "labels": [
+      "bug",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`Event.Model` exists (`internal/traceproxy/proxy.go:17`) but the handler never sets it (`internal/traceproxy/proxy.go:91`). Every trace has an empty model, so cost, routing analysis and per-model dashboards are impossible. `README.md:4-5` also says traces include the prompt and token usage, and neither is captured.\n\n## Proposal\n- Before proxying, read the request body up to a configurable cap into a buffer and decode only `model` and `stream` with a streaming `json.Decoder`. Restore `r.Body` with `io.MultiReader(bytes.NewReader(buf), r.Body)`.\n- Record `model` and `stream` on `Event`. If the body exceeds the cap or is not JSON, leave the model empty and set `model_parse_error`.\n\n## Acceptance criteria\n- [ ] Test: POST `{\"model\":\"llama-3.1-8b\",\"messages\":[]}` produces `event.Model == \"llama-3.1-8b\"` and the upstream receives the identical body bytes.\n- [ ] Test: a 10 MiB body with `model` as its first key does not get buffered in full (assert peak buffer size).\n- [ ] Test: a non-JSON body is proxied unchanged and the event has an empty model."
+  },
+  {
+    "title": "Capture token usage from JSON and SSE responses through a streaming tee",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\nThe proxy only observes the status code (`internal/traceproxy/proxy.go:96-104`). It never reads the response body, so `usage.prompt_tokens` and `usage.completion_tokens` are not traced, despite `README.md:5`. Buffering the full response to get them would break streaming and use memory proportional to output size.\n\n## Proposal\n- Wrap the recorder's `Write` with an incremental parser. For `application/json`, keep a bounded tail buffer and parse `usage` at EOF. For `text/event-stream`, split on `\\n\\n`, parse each `data:` JSON line and keep the last `usage` object seen. Discard parsed bytes as soon as each event is handled.\n- Optionally add `stream_options.include_usage=true` to streaming requests when the client did not set it, and suppress the extra usage-only chunk if the client did not ask for it (behind a flag).\n- Add `prompt_tokens`, `completion_tokens`, `total_tokens` and `time_to_first_token_ms` to `Event`.\n\n## Acceptance criteria\n- [ ] Test: a non-streamed JSON response with `usage` produces matching token counts in the event.\n- [ ] Test: an SSE stream whose final chunk carries `usage` produces matching counts, and `time_to_first_token_ms` is less than the total duration.\n- [ ] Test: a 50 MiB streamed response keeps parser memory under a fixed bound (for example 64 KiB) and is delivered to the client byte-for-byte.\n- [ ] Malformed SSE lines do not affect the bytes delivered to the client."
+  },
+  {
+    "title": "Replace per-request goroutine emits with a bounded trace queue and drop counter",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\nEach request starts `go sink.Emit(event)` (`internal/traceproxy/proxy.go:92`). Emit does a blocking HTTP POST with the shared 5s client (`cmd/trace-proxy/main.go:23`). When Kafka REST is slow or down, goroutines and open connections grow with request rate (up to rate x 5s), with no backpressure and no record of lost events. Sink errors are discarded silently (`proxy.go:43-47`, `:67-71`).\n\n## Proposal\n- Add an `AsyncSink` with a fixed-capacity channel (`TRACE_QUEUE_SIZE`), N workers and optional batching (Kafka REST accepts multiple `records`).\n- When the queue is full, drop the event and increment a `dropped` counter. Never block the request path.\n- Log a rate-limited warning on drops.\n\n## Acceptance criteria\n- [ ] Test: with a sink that blocks forever and queue size 10, 1000 requests complete, the goroutine count stays bounded, and the dropped counter is 990 or more.\n- [ ] Test: the batching path sends one Kafka REST request with multiple `records`.\n- [ ] The request path never waits on the sink (assert handler latency with a blocking sink)."
+  },
+  {
+    "title": "Retry trace sink deliveries with backoff and treat non-2xx as failure",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`HTTPSink.Emit` and `KafkaRESTSink.Emit` (`internal/traceproxy/proxy.go:43-47`, `:67-71`) only check transport errors. A 4xx or 5xx from Kafka REST (for example 422 for a schema error, or 503 during a rebalance) counts as success, and transport errors are dropped without a retry. `json.Marshal` errors are also ignored (`proxy.go:34`, `:61`).\n\n## Proposal\n- Change `Sink` to `Emit(ctx, []Event) error`.\n- Retry on transport errors, 429 and 5xx with exponential backoff and jitter, honoring `Retry-After`, up to a max number of attempts. Do not retry on other 4xx.\n- Expose sent, retried and failed counts to the metrics issue.\n\n## Acceptance criteria\n- [ ] Test: a sink server returns 503 twice and then 200, and the event is delivered once after 2 retries.\n- [ ] Test: a 400 response is not retried and is counted as failed.\n- [ ] Test: the Kafka REST response body `offsets[].error` is checked and counted as a failure."
+  },
+  {
+    "title": "Authenticate Kafka REST sink requests with KAFKA_REST_TOKEN",
+    "labels": [
+      "security",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`KafkaRESTSink` (`internal/traceproxy/proxy.go:52-72`) sends no `Authorization` header. `cmd/trace-proxy/main.go:26` builds it without a token, so `TRACE_SINK_TOKEN` is silently ignored in `kafka-rest` mode. `KAFKA_REST_TOKEN` is a declared secret (`internal/runtimeconfig/config.go:17`) that nothing uses. The trace topic must therefore accept unauthenticated writes, and anything on the network can forge traces.\n\n## Proposal\n- Add a `Token` field to `KafkaRESTSink`, populated from `KAFKA_REST_TOKEN` with fallback to `TRACE_SINK_TOKEN`, and send it as a Bearer token. Support basic auth for Karapace deployments.\n- Fail startup in production if the sink URL is set without credentials.\n\n## Acceptance criteria\n- [ ] Test: the Kafka REST fake server receives `Authorization: Bearer <token>`.\n- [ ] Test: `TRACE_SINK_FORMAT=kafka-rest` with `TRACE_SINK_TOKEN` set results in an authenticated request.\n- [ ] README documents which token applies to each sink format."
+  },
+  {
+    "title": "Drain in-flight streams and the trace queue on SIGTERM",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:proxy"
+    ],
+    "body": "## Problem\n`cmd/trace-proxy/main.go:31` calls `log.Fatal(server.ListenAndServe())`. There is no signal handling and no `server.Shutdown`. On a Kubernetes rollout, SIGTERM kills the process immediately, which cuts off in-flight streamed completions and loses every event still in an `Emit` goroutine (`proxy.go:92`).\n\n## Proposal\n- Use `signal.NotifyContext` for SIGTERM and SIGINT, then call `server.Shutdown(ctx)` with a configurable grace period (`SHUTDOWN_TIMEOUT`, default 30s). After that, flush the trace queue with a deadline.\n- Make `/healthz` (or a new `/readyz`) return 503 once shutdown starts.\n\n## Acceptance criteria\n- [ ] Test: start the server, begin a slow streamed request, trigger shutdown, and the stream completes and its event is emitted.\n- [ ] Test: after shutdown begins, readiness returns 503.\n- [ ] Queued events not flushed within the deadline are counted as dropped and logged once."
+  },
+  {
+    "title": "Configure upstream transport timeouts separately from the trace sink client",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:proxy"
+    ],
+    "body": "## Problem\nThe reverse proxy uses `http.DefaultTransport` (`internal/traceproxy/proxy.go:75` sets no `Transport`). There is no `ResponseHeaderTimeout`, no limit on idle connections per host and no dial timeout tuned for the upstream. A hung vLLM pod holds client connections until the server `WriteTimeout`. Separately, one `http.Client{Timeout: 5s}` (`cmd/trace-proxy/main.go:23`) is used only for sinks, and its name suggests it covers the upstream, which it does not.\n\n## Proposal\n- Build a dedicated `*http.Transport` for each upstream with configurable `DialContext` timeout, `TLSHandshakeTimeout`, `ResponseHeaderTimeout` (time to first byte, default 60s), `MaxIdleConnsPerHost` and `IdleConnTimeout`.\n- Rename the sink client and keep its own timeout.\n- Return an OpenAI-shaped 504 on time-to-first-byte timeout and record `error: \"upstream_timeout\"` in the event.\n\n## Acceptance criteria\n- [ ] Test: an upstream that never sends headers gets a 504 after the configured timeout, and the event has `error=upstream_timeout`.\n- [ ] Test: an upstream that sends headers quickly and then streams slowly is not cut off by `ResponseHeaderTimeout`.\n- [ ] New settings are documented."
+  },
+  {
+    "title": "Enforce request body size limits and validate X-Session-ID",
+    "labels": [
+      "security",
+      "P2",
+      "area:limits"
+    ],
+    "body": "## Problem\nThe handler (`internal/traceproxy/proxy.go:82-90`) puts no limit on the request body, so a client can stream an arbitrarily large body to the upstream for up to `ReadTimeout` (120s, `cmd/trace-proxy/main.go:29`). `X-Session-ID` is copied into the trace unvalidated (`proxy.go:91`), up to the default 1 MiB header limit. That allows oversized or control-character values in downstream Kafka and Langfuse data.\n\n## Proposal\n- Wrap `r.Body` in `http.MaxBytesReader` with `MAX_REQUEST_BYTES` (default 10 MiB) and return 413 with an OpenAI-shaped error.\n- Set `server.MaxHeaderBytes`.\n- Accept `X-Session-ID` only if it matches `^[A-Za-z0-9._:-]{1,128}$`. Otherwise drop it and set `session_id_invalid: true`.\n\n## Acceptance criteria\n- [ ] Test: a body larger than the limit returns 413, and the fake upstream gets either no request or a cancelled one.\n- [ ] Test: a 1 KiB session ID with newlines is not copied into the event.\n- [ ] Limits are documented in the README."
+  },
+  {
+    "title": "Support custom CA bundles and mTLS for upstream connections",
+    "labels": [
+      "security",
+      "P2",
+      "area:proxy"
+    ],
+    "body": "## Problem\n`cmd/trace-proxy/main.go:18-22` accepts any URL scheme for `LLM_UPSTREAM_URL`, and the proxy uses default system roots (`internal/traceproxy/proxy.go:75`). Self-hosted vLLM behind an internal CA cannot be reached over TLS without rebuilding the distroless image (`Dockerfile:12`). mTLS client certs are not supported. A production deployment can point at a proprietary provider over plain `http://` with no warning.\n\n## Proposal\n- Add per-upstream `tls.ca_file`, `tls.cert_file`, `tls.key_file` and `tls.server_name`, loaded through the existing `_FILE` mechanism (`internal/runtimeconfig/config.go:58-75`).\n- Set TLS 1.2 as the minimum version.\n- In production, reject `http://` for upstreams not marked `internal: true`.\n\n## Acceptance criteria\n- [ ] Test: an `httptest.NewTLSServer` upstream with a generated CA works when `ca_file` is set and fails without it.\n- [ ] Test: an mTLS upstream that requires a client cert accepts the configured cert.\n- [ ] Test: production mode with an `http://` external upstream fails at startup."
+  },
+  {
+    "title": "Route requests to multiple upstreams by model name",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:routing"
+    ],
+    "body": "## Problem\nThe proxy supports exactly one upstream. `main.go:18` reads one `LLM_UPSTREAM_URL`, and `traceproxy.New` takes a single `*url.URL` (`internal/traceproxy/proxy.go:74-75`). Teams that run a local vLLM for small models and a hosted provider for others need one proxy deployment per upstream, and agents need to know which one to call.\n\n## Proposal\n- Add a routing config file (`TRACE_PROXY_ROUTES_FILE`, YAML or JSON) with entries: `{name, url, provider, models: [glob], api_key_env, model_rewrite}`.\n- Select the route using the model parsed by the body-peek issue. Unknown models get an OpenAI-shaped 404 `model_not_found`.\n- Serve `GET /v1/models` from the merged config.\n- Keep `LLM_UPSTREAM_URL` as the single-route default for backward compatibility.\n- Add `upstream` to `Event`.\n\n## Acceptance criteria\n- [ ] Test: two fake upstreams; `model=llama-*` goes to A and `model=gpt-*` goes to B, and each event has the correct `upstream`.\n- [ ] Test: an unknown model returns 404 and neither upstream is called.\n- [ ] Test: `GET /v1/models` lists the configured models.\n- [ ] With only `LLM_UPSTREAM_URL` set, current behavior is unchanged (existing test passes)."
+  },
+  {
+    "title": "Retry idempotent upstream failures with exponential backoff and Retry-After",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:routing"
+    ],
+    "body": "## Problem\nOn a connection error, the default `ReverseProxy.ErrorHandler` returns a bare 502 (`internal/traceproxy/proxy.go:75`, no `ErrorHandler` set). An upstream 429 or 503 goes straight to the agent. Brief vLLM restarts or provider rate-limit spikes therefore fail agent runs. The request body is consumed on the first attempt, so a retry is not possible today.\n\n## Proposal\n- Buffer request bodies up to the size limit so they can be replayed.\n- Retry on dial errors, 429, 502, 503 and 504 that happen before any response byte reaches the client. Use exponential backoff with jitter, honor `Retry-After`, and allow a configurable max of attempts and total retry time.\n- Never retry once streaming to the client has started.\n- Record `attempts` on the event.\n\n## Acceptance criteria\n- [ ] Test: the upstream returns 503 twice and then 200, the client gets 200 and the event has `attempts=3`.\n- [ ] Test: an upstream 429 with `Retry-After: 1` delays the retry by about 1s.\n- [ ] Test: an upstream that fails mid-stream is not retried, and the client sees the partial stream.\n- [ ] Test: an upstream 400 is not retried."
+  },
+  {
+    "title": "Add ordered fallback chains across upstreams per model",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:routing"
+    ],
+    "body": "## Problem\nWith a single upstream (`cmd/trace-proxy/main.go:18`, `internal/traceproxy/proxy.go:74`), there is nowhere to send traffic when a self-hosted model is down or a proprietary provider is rate-limited. Open-source-first deployments want to try local vLLM first and fall back to a hosted model only when needed, with that choice visible in traces.\n\n## Proposal\n- Extend the route config with `fallbacks: [route_name, ...]` and an optional model rewrite for each fallback.\n- After retries on one route are exhausted (per the retry issue), try the next route.\n- Add a circuit breaker per upstream (open after N consecutive failures, half-open after a cooldown) so failing upstreams are skipped right away.\n- Record `upstream`, `fallback_from` and `fallback_reason` in `Event`.\n\n## Acceptance criteria\n- [ ] Test: primary returns 503 and secondary returns 200; the client gets 200, and the event shows `upstream=secondary` and `fallback_from=primary`.\n- [ ] Test: after the breaker opens, the primary gets no requests until the cooldown ends.\n- [ ] Test: a fallback to a different provider rewrites `model` in the forwarded body."
+  },
+  {
+    "title": "Enforce per-project request and token rate limits with 429 responses",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:limits"
+    ],
+    "body": "## Problem\nThe handler (`internal/traceproxy/proxy.go:82-93`) has no rate limiting. One misbehaving agent loop can saturate a shared vLLM instance or use up a provider's org-wide quota for every project.\n\n## Proposal\n- After per-project authentication, apply token-bucket limits per project and per key: requests per minute, and tokens per minute using an estimate from prompt size that is reconciled with actual usage from the response tee.\n- Keep state in memory by default and optionally in Redis (`REDIS_URL` is already a declared secret at `internal/runtimeconfig/config.go:17`) for multi-replica deployments.\n- Return 429 with `Retry-After` and `x-ratelimit-remaining-*` headers that match OpenAI's names.\n\n## Acceptance criteria\n- [ ] Test: with a 2 RPM limit, the third request in a minute gets 429 with `Retry-After`, and the upstream sees 2 requests.\n- [ ] Test: TPM accounting uses the real `usage` from the response after completion.\n- [ ] Test: limits for project A do not affect project B.\n- [ ] Rejected requests still emit an event with `status_code=429` and `limited_by`."
+  },
+  {
+    "title": "Compute per-call cost from a model price table and enforce project budgets",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:limits"
+    ],
+    "body": "## Problem\n`Event` (`internal/traceproxy/proxy.go:13-21`) has no token or cost fields, and there is no price data anywhere in the repo. Teams cannot see spend per project, and nothing stops a project from running past its monthly budget on a proprietary upstream.\n\n## Proposal\n- Add a price table (file-configured, per route and model: input, output and cached-input price per million tokens; self-hosted routes can set a GPU-hour based rate or 0).\n- Compute `cost_usd` from captured usage and add it to `Event`.\n- Add per-project monthly budgets with soft (warn header) and hard (402 or 429 with an error body) thresholds. Keep running totals in Redis or another persistent store so they survive restarts.\n\n## Acceptance criteria\n- [ ] Test: usage 1000/500 tokens at $1/$2 per million gives `cost_usd=0.002`.\n- [ ] Test: once a project passes its hard budget, the next request is rejected before reaching the upstream.\n- [ ] Test: a model missing from the price table produces `cost_usd` null and a warning metric, not an error."
+  },
+  {
+    "title": "Expose Prometheus metrics for requests, latency, tokens and sink health",
+    "labels": [
+      "observability",
+      "P2",
+      "area:observability"
+    ],
+    "body": "## Problem\nThe proxy only logs one startup line (`cmd/trace-proxy/main.go:30`). It has no `/metrics` endpoint. Operators cannot alert on upstream error rates, latency, time to first token or trace sink failures, and sink errors are swallowed (`internal/traceproxy/proxy.go:43-47`, `:67-71`).\n\n## Proposal\nServe `/metrics` on a separate port (`METRICS_PORT`) with:\n- `traceproxy_requests_total{upstream,model,status_class,project}`\n- `traceproxy_request_duration_seconds` and `traceproxy_time_to_first_token_seconds` histograms\n- `traceproxy_tokens_total{direction}` and `traceproxy_cost_usd_total`\n- `traceproxy_sink_events_total{result=sent|retried|failed|dropped}` and `traceproxy_sink_queue_depth`\n- `traceproxy_upstream_inflight`\n\nKeep label cardinality bounded (models only from config).\n\n## Acceptance criteria\n- [ ] Test: after one proxied request, scraping `/metrics` shows `traceproxy_requests_total` increased by 1 with the expected labels.\n- [ ] Test: an unknown model value from a client does not create a new label value.\n- [ ] Test: dropped sink events appear in `traceproxy_sink_events_total{result=\"dropped\"}`.\n- [ ] The metrics list is documented in the README."
+  },
+  {
+    "title": "Emit OpenTelemetry spans using GenAI semantic conventions",
+    "labels": [
+      "observability",
+      "P2",
+      "area:observability"
+    ],
+    "body": "## Problem\nTraces are a custom JSON `Event` (`internal/traceproxy/proxy.go:13-21`) sent only to an HTTP sink or Kafka REST (`cmd/trace-proxy/main.go:24-27`). Inbound `traceparent` is forwarded but not joined, so LLM calls cannot be connected to the agent's distributed trace in Tempo, Jaeger or any OTLP backend.\n\n## Proposal\n- Add an OTLP exporter (enabled by `OTEL_EXPORTER_OTLP_ENDPOINT`).\n- Create a client span for each call as a child of the inbound `traceparent`, named `chat {gen_ai.request.model}`, with `gen_ai.operation.name`, `gen_ai.system` (provider), `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons`, `server.address` and `error.type`.\n- Inject `traceparent` into the upstream request.\n- Prompt and completion content events are off by default and pass through redaction.\n\n## Acceptance criteria\n- [ ] Test with an in-memory span exporter: one span per request, parented to the inbound `traceparent`, with the GenAI attributes populated.\n- [ ] Test: the fake upstream receives a `traceparent` whose trace ID matches.\n- [ ] Test: with content capture disabled, no prompt text appears in span attributes or events."
+  },
+  {
+    "title": "Add a Langfuse sink that maps calls to traces and generations",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`LANGFUSE_SECRET_KEY` is a declared secret (`internal/runtimeconfig/config.go:17`), but the only sinks are `HTTPSink` and `KafkaRESTSink` (`internal/traceproxy/proxy.go:25-72`), selected by a single `if` in `cmd/trace-proxy/main.go:24-27`. Teams using Langfuse for prompt and eval workflows must write their own Kafka consumer to get proxy traces into it.\n\n## Proposal\n- Add `LangfuseSink` that posts batches to `/api/public/ingestion` with basic auth (`LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`).\n- Map `session_id` to a Langfuse session and each call to a `generation` with model, usage, cost, latency and redacted input and output.\n- Change `TRACE_SINK_FORMAT` to a list so one deployment can fan out to several sinks (for example Kafka and Langfuse).\n\n## Acceptance criteria\n- [ ] Test: a fake Langfuse server receives a `generation-create` body with model, usage and sessionId.\n- [ ] Test: `TRACE_SINK_FORMAT=kafka-rest,langfuse` delivers to both fake servers.\n- [ ] A Langfuse outage does not block Kafka delivery (independent queues)."
+  },
+  {
+    "title": "Redact secrets and PII from trace payloads before they leave the proxy",
+    "labels": [
+      "security",
+      "P2",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`README.md:4-5` describes traces that contain prompts and responses, and the token-usage, OTel and Langfuse issues all add content capture. Today `Event` (`internal/traceproxy/proxy.go:13-21`) has no content and no redaction layer. Once content capture lands, API keys, bearer tokens, emails and card numbers pasted into prompts would go to Kafka and third-party observability tools in plain text.\n\n## Proposal\n- Add a `Redactor` stage that runs on captured content before it is enqueued for any sink.\n- Built-in detectors: provider key formats (`sk-`, `sk-ant-`, `AKIA`), JWTs, `Bearer` tokens, emails, phone numbers and Luhn-valid card numbers. Users can add custom regexes from config.\n- Modes: `off`, `mask`, `hash` (HMAC with a secret key, for joins), and `drop_content`. Default to `drop_content` until configured.\n- Add `redactions: {type: count}` to the event.\n\n## Acceptance criteria\n- [ ] Table test: each detector masks its sample and leaves nearby text alone.\n- [ ] Test: a prompt containing `sk-ant-...` produces an event JSON with no substring of the key.\n- [ ] Fuzz test: the redactor never panics and never makes output longer than input plus a bounded overhead.\n- [ ] Redaction runs off the request path (benchmark shows no added client latency)."
+  },
+  {
+    "title": "Add an Anthropic Messages API adapter behind the OpenAI-compatible surface",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:providers"
+    ],
+    "body": "## Problem\nThe proxy forwards bytes unchanged to one OpenAI-compatible upstream (`internal/traceproxy/proxy.go:75`). `ANTHROPIC_API_KEY` is a declared secret (`internal/runtimeconfig/config.go:17`) but cannot be used: Anthropic's `/v1/messages` uses a different request shape (top-level `system`, `max_tokens` required, content blocks), a different auth header (`x-api-key` plus `anthropic-version`), and different SSE event types (`message_start`, `content_block_delta`, `message_delta`).\n\n## Proposal\n- Add a `provider` field to routes and a `ProviderAdapter` interface: `TranslateRequest`, `TranslateResponse` and `TranslateStream` (an incremental `io.Writer`).\n- Implement `anthropic`: map chat messages and tools to Messages API format and back, map `stop_reason` to `finish_reason`, and map usage `input_tokens` and `output_tokens`.\n- Also allow passthrough of native `/v1/messages` for Anthropic SDK clients.\n\n## Acceptance criteria\n- [ ] Golden-file tests for request translation (system prompt, tools, images) and non-streaming response translation.\n- [ ] Streaming test: a recorded Anthropic SSE fixture becomes OpenAI `chat.completion.chunk` events ending in `[DONE]`, with usage captured.\n- [ ] Test: a native `/v1/messages` passthrough keeps the body byte-identical and injects `x-api-key`."
+  },
+  {
+    "title": "Add Azure OpenAI, Bedrock and Vertex provider adapters",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:providers"
+    ],
+    "body": "## Problem\nBesides direct OpenAI-shaped upstreams, the only option is a single `LLM_UPSTREAM_URL` (`cmd/trace-proxy/main.go:18`). Azure OpenAI needs `/openai/deployments/{deployment}/chat/completions?api-version=...` and an `api-key` header. Bedrock needs SigV4 signing (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are already declared at `internal/runtimeconfig/config.go:17`). Vertex needs Google OAuth access tokens. None of these can be reached today.\n\n## Proposal\nUsing the `ProviderAdapter` interface from the Anthropic issue:\n- `azure`: map model to deployment, add the `api-version` query parameter and the `api-key` header.\n- `bedrock`: use the Converse and ConverseStream APIs with SigV4 via aws-sdk-go-v2 signer, and decode the event-stream framing to OpenAI chunks.\n- `vertex`: get tokens from workload identity or a service account file, and call the OpenAI-compatible endpoint or Gemini `generateContent`.\n\nEach adapter is optional and has its own build tag or config switch.\n\n## Acceptance criteria\n- [ ] Azure test: the fake upstream receives the deployment path, `api-version` and `api-key`.\n- [ ] Bedrock test: the request carries a valid SigV4 `Authorization` header (checked against the signer test vector), and a recorded ConverseStream fixture becomes OpenAI chunks.\n- [ ] Vertex test: the token source is called and the token is cached until expiry.\n- [ ] README provider matrix lists supported features per adapter."
+  },
+  {
+    "title": "Hot-reload routing, keys and limits config without dropping connections",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:proxy"
+    ],
+    "body": "## Problem\nConfig is read once at startup. `runtimeconfig.Load` (`cmd/trace-proxy/main.go:15`) copies `KIONGA_CONFIG_FILE` values into environment variables (`internal/runtimeconfig/config.go:47-55`), and the upstream and sink are fixed at construction (`cmd/trace-proxy/main.go:18-28`). Rotating a provider key, adding a model route or changing a project limit needs a pod restart, which also cuts off streams (see the graceful shutdown issue).\n\n## Proposal\n- Keep routes, keys, limits and prices in an immutable `Config` stored in an `atomic.Pointer`.\n- Watch the mounted files (poll mtime, because Kubernetes ConfigMap symlink swaps defeat inotify watches) and reload on SIGHUP.\n- Validate the new config fully before swapping. If it is invalid, keep the old one and increment `traceproxy_config_reload_errors_total`.\n- In-flight requests keep the config snapshot they started with.\n\n## Acceptance criteria\n- [ ] Test: change the routes file and send SIGHUP, and the next request goes to the new upstream while an in-flight stream on the old one completes.\n- [ ] Test: an invalid file keeps the previous config and records an error.\n- [ ] Test: a rotated `LLM_UPSTREAM_API_KEY_FILE` is used on the next request."
+  },
+  {
+    "title": "Build a fake upstream harness and cover streaming, errors and sinks in tests",
+    "labels": [
+      "testing",
+      "P2",
+      "area:testing"
+    ],
+    "body": "## Problem\n`internal/traceproxy/proxy_test.go` has two tests. `TestProxyForwardsAndEmitsTrace` (`proxy_test.go:17-40`) sends a `nil` body (`:29`) to an upstream that only writes a status. No test covers SSE streaming (which is broken, see the SSE flushing issue), upstream connection failure (502), `HTTPSink` auth headers (`proxy.go:39-42`), `/healthz` (`proxy.go:83-87`), or header forwarding beyond the agent header.\n\n## Proposal\n- Add `internal/testutil/fakeupstream` with programmable behaviors: JSON completion with usage, SSE stream with per-chunk delay, stall, mid-stream disconnect, 429 with `Retry-After`, and a slow-header response. Each call is recorded for assertions.\n- Add a fake sink that records events with timeouts instead of blocking channel reads, so a missing event cannot hang the test.\n\n## Acceptance criteria\n- [ ] Tests exist for: SSE incremental delivery, upstream down giving 502 plus an event with status 502, `HTTPSink` sending `Authorization: Bearer`, and `/healthz` not touching the upstream.\n- [ ] All event receives use `select` with a timeout.\n- [ ] `go test -race -count=3 ./...` passes in CI.\n- [ ] Coverage for `internal/traceproxy` is reported in CI and is above 80%."
+  },
+  {
+    "title": "Add fuzz tests for request model peeking and SSE usage parsing",
+    "labels": [
+      "testing",
+      "P3",
+      "area:testing"
+    ],
+    "body": "## Problem\nThe body-peek and response-tee issues add parsers that read untrusted bytes on the request path (client JSON, and upstream SSE framing split across arbitrary `Write` boundaries in `statusRecorder`, `internal/traceproxy/proxy.go:96-104`). A panic there takes down the request, and an off-by-one in SSE splitting can corrupt bytes delivered to clients. No fuzz targets exist in the repo.\n\n## Proposal\nAdd native Go fuzz targets:\n- `FuzzPeekModel(data []byte)`: never panics, never reads past the cap, and the restored body equals the input.\n- `FuzzSSETee(data []byte, splits []uint16)`: feeding the stream in arbitrary chunk sizes produces the same output bytes as input and the same parsed usage as a single write.\n\nSeed the corpus with real vLLM, llama.cpp and OpenAI SSE captures.\n\n## Acceptance criteria\n- [ ] `go test -fuzz=FuzzSSETee -fuzztime=60s` runs clean locally, with seeds committed under `testdata/fuzz`.\n- [ ] The CI job runs each fuzz target for 30s on pull requests that touch the parsers.\n- [ ] Any crasher found is added to the corpus with a regression test."
+  },
+  {
+    "title": "Return trace request IDs and record start time and error class in Event",
+    "labels": [
+      "observability",
+      "P3",
+      "area:tracing"
+    ],
+    "body": "## Problem\n`Event` (`internal/traceproxy/proxy.go:13-21`) has no request ID, so a trace cannot be linked to an agent log line or an upstream provider request ID. `CreatedAt` is set after the response completes (`proxy.go:91`), not when the call started, which skews time-ordering of long streams. Upstream transport failures appear only as status 502 with no reason. The proxy also writes no access logs (only `main.go:30`).\n\n## Proposal\n- Generate or accept `X-Request-ID` (validated), forward it upstream, return it to the client, and store it as `request_id`.\n- Capture the upstream `x-request-id` or `request-id` as `upstream_request_id`.\n- Add `started_at`, keep `created_at` as the end time, and add `error` (`upstream_unreachable`, `upstream_timeout`, `client_cancelled`, `truncated`).\n- Add a structured `log/slog` access log line per request, without bodies.\n\n## Acceptance criteria\n- [ ] Test: the response carries an `X-Request-ID` equal to `event.request_id`.\n- [ ] Test: when the client cancels mid-stream, the event has `error=client_cancelled`.\n- [ ] Test: an upstream `x-request-id` is copied into the event."
+  },
+  {
+    "title": "Add a readiness endpoint and restrict /healthz to GET",
+    "labels": [
+      "reliability",
+      "P3",
+      "area:proxy"
+    ],
+    "body": "## Problem\n`/healthz` (`internal/traceproxy/proxy.go:83-87`) answers any method with 200 and checks nothing. Kubernetes cannot tell a proxy whose upstream is unreachable or whose sink is failing apart from a healthy one, so traffic keeps going to replicas that will return 502. The path is also taken from the proxied namespace: an upstream that serves `/healthz` cannot be reached through the proxy.\n\n## Proposal\n- Keep `/healthz` as liveness, GET and HEAD only (405 otherwise).\n- Add `/readyz`: report ready only if at least one route per configured model group had a successful probe or request in the last N seconds, config is loaded, and the process is not shutting down.\n- Serve health and metrics on the admin port so they never collide with upstream paths.\n\n## Acceptance criteria\n- [ ] Test: `POST /healthz` returns 405.\n- [ ] Test: with the fake upstream stopped, `/readyz` returns 503 within the probe interval, and returns 200 after it restarts.\n- [ ] README documents both endpoints and the admin port."
+  },
+  {
+    "title": "Remove gateway-only validation and unrelated secrets from runtimeconfig",
+    "labels": [
+      "refactor",
+      "P3",
+      "area:config"
+    ],
+    "body": "## Problem\n`internal/runtimeconfig/config.go:79-124` (`ValidateGateway`) validates OIDC, DATABASE_URL, workspace domains and credential keys for a different service. Nothing in `cmd/` or `internal/traceproxy/` calls it; only its tests do (`config_test.go:64-112`). `SecretNames` (`config.go:17`) lists 20 secrets, mostly unrelated (`KFP_TOKEN`, `OPENFAAS_PASSWORD`, `KIONGA_JUPYTER_TOKEN`). That makes it unclear which secrets this proxy actually uses. It also pulls in `golang.org/x/net/publicsuffix` (`go.mod:7`) only for dead code.\n\n## Proposal\n- Delete `ValidateGateway` and its tests, or move them to the gateway repo.\n- Replace it with `ValidateTraceProxy` for this service's real production checks (upstream scheme, sink credentials, key file present).\n- Cut `SecretNames` down to the secrets the proxy reads, with a comment pointing to each one's use site.\n- Run `go mod tidy`.\n\n## Acceptance criteria\n- [ ] `grep -r ValidateGateway` returns nothing.\n- [ ] `go.mod` no longer requires `golang.org/x/net` unless something else uses it.\n- [ ] Every entry in `SecretNames` has at least one read site, enforced by a test that scans for the env key in the package sources.\n- [ ] `make verify` passes."
+  },
+  {
+    "title": "Fix the Dockerfile EXPOSE port to match the 8081 default",
+    "labels": [
+      "dx",
+      "P3",
+      "area:deploy"
+    ],
+    "body": "## Problem\n`Dockerfile:14` declares `EXPOSE 8080`, but the server listens on `PORT` with default `8081` (`cmd/trace-proxy/main.go:29`, `README.md:21`). Tools that read image metadata (Docker Desktop, `docker run -P`, some Helm and compose generators) map the wrong port, so the container looks up while every request fails.\n\n## Proposal\nChange to `EXPOSE 8081`. Add an `EXPOSE` for the metrics or admin port once that issue lands.\n\n## Acceptance criteria\n- [ ] `docker inspect ghcr.io/kiongahq/trace-proxy:dev` shows `8081/tcp` in `ExposedPorts`.\n- [ ] `docker run -P` followed by `curl /healthz` on the mapped port returns `{\"status\":\"ok\"}`, as a CI smoke step in the image workflow."
+  },
+  {
+    "title": "Correct the README trace contents and document the event schema and examples",
+    "labels": [
+      "docs",
+      "P2",
+      "area:docs"
+    ],
+    "body": "## Problem\n`README.md:3-7` says each trace contains \"prompt, response, timing, token usage\". The emitted `Event` (`internal/traceproxy/proxy.go:13-21`) has only agent, version, session_id, an always-empty model, status_code, duration_ms and created_at. The README also says provider keys never leave the proxy, which the code does not enforce (see the upstream-key issue). It gives no example client setup, does not document the `X-Session-ID` header used at `proxy.go:91`, and has no schema for consumers of the `mlaiops.llm.traces` topic.\n\n## Proposal\n- Rewrite the overview to describe current behavior and link the roadmap issues for content and usage capture.\n- Add `docs/event-schema.md` with a versioned JSON schema (add a `schema_version` field to `Event`).\n- Add quickstarts: the OpenAI Python SDK with `base_url`, vLLM upstream, and llama.cpp server upstream, plus the `X-Session-ID` header.\n- Add a section on the security model (who holds which keys).\n\n## Acceptance criteria\n- [ ] Every field in `Event` appears in `docs/event-schema.md`, enforced by a test that compares struct JSON tags with the schema file.\n- [ ] README makes no claims about fields the code does not emit.\n- [ ] The quickstart commands are run in CI against a fake upstream (or a README code block test)."
+  }
+]

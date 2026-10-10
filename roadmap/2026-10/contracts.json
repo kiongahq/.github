@@ -1,0 +1,281 @@
+[
+  {
+    "title": "Make an OpenAPI 3.1 document in contracts the source of truth for the gateway API",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:openapi"
+    ],
+    "body": "## Problem\nThe gateway's OpenAPI document is a hand-built Go map in `platform/go/internal/httpapi/openapi.go:16-93`, served at `GET /api/openapi.json` (`platform/go/internal/httpapi/server.go:120`). It declares `openapi: 3.0.3` and `version: 0.1.0`, and each operation has only a `summary`: no parameters, request bodies, response schemas, status codes or security schemes. Request and response shapes live only in Go structs (`platform/go/pkg/api/types.go`, `pipelines.go`, `feature_stores.go`). No consumer can generate a client or validate traffic against it, and the contracts repo has no copy at all.\n\n## Proposal\nAdd `openapi/gateway/v1.yaml` (OpenAPI 3.1) to contracts with full component schemas built from the `pkg/api` types, `bearerAuth` security, and documented status codes. Have the gateway embed the file from the `contracts/` submodule (`//go:embed`) and serve it at `/api/openapi.json`, replacing the map in `openapi.go`.\n\n## Acceptance criteria\n- [ ] `openapi/gateway/v1.yaml` exists, passes `redocly lint` (or `spectral lint`) in contracts CI\n- [ ] Every operation declares request body (where applicable), success response schema and error responses\n- [ ] `openapi.go` no longer builds paths by hand; the served document is byte-identical to the contracts file at the pinned commit\n- [ ] `info.version` follows the contracts release tag rather than a hardcoded `0.1.0`"
+  },
+  {
+    "title": "Add a route drift test: 41 of 122 gateway routes are missing from OpenAPI",
+    "labels": [
+      "testing",
+      "P2",
+      "area:openapi"
+    ],
+    "body": "## Problem\nThe gateway registers 122 distinct `/api/v1/...` routes via `mux.HandleFunc` across `platform/go/internal/httpapi/*.go`, but 41 are absent from `openapi.go` and the `openapiPaths` hook in `iam.go:33`. Examples: `POST /api/v1/pipelines/validate` (`pipeline_definitions.go:18`), `POST /api/v1/pipelines/runs/{id}/logs`, `GET /api/v1/logs` and `GET /api/v1/logs/stream` (`logs.go:22-24`), `/api/v1/pipelines/preflight`, all `/api/v1/admin/feature-stores*` routes and `/api/v1/observability/log-export`. Nothing fails when a route is added without documentation.\n\n## Proposal\nAdd a Go test in `httpapi` that walks every registered pattern (wrap `registerRoutes` to record `METHOD path`) and asserts each one has a matching path and method in the contracts OpenAPI document, and the reverse (no documented operation without a handler). Keep an explicit, commented allowlist for internal-only routes.\n\n## Acceptance criteria\n- [ ] Test fails when a `HandleFunc` route has no OpenAPI operation, naming the route\n- [ ] Test fails when an OpenAPI operation has no handler\n- [ ] The 41 currently missing routes are documented or allowlisted with a reason\n- [ ] Test runs in platform CI (`.github/workflows/cicd.yml`) with `submodules: recursive`"
+  },
+  {
+    "title": "Define one error response schema and apply it to gateway, serving manager and agent proxy",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:openapi"
+    ],
+    "body": "## Problem\nThree different error shapes reach clients:\n- Gateway: `api.APIError{error, message}` (`platform/go/pkg/api/types.go:707-710`, written by `writeError` at `platform/go/internal/httpapi/server.go:1578`).\n- Serving manager: `{\"error\": \"<text>\"}` with no code (`serving/cmd/serving-manager/main.go:46,51,67,72`).\n- Agent invoke: the gateway copies the runtime's status and body verbatim (`server.go:1429`), so callers get FastAPI's `{\"detail\": ...}` from `agent-runtime/agent_runtime/app.py:66,152` under a gateway URL.\nClients cannot write one error handler.\n\n## Proposal\nAdd `common/error.schema.json` (`{error: code, message, details?}` with a documented code registry) and reference it from every OpenAPI document in contracts. Make the agent proxy map non-2xx runtime responses into this shape, and update the serving manager to emit it.\n\n## Acceptance criteria\n- [ ] `common/error.schema.json` with a list of stable `error` codes (`invalid_request`, `not_found`, `agent_not_ready`, ...)\n- [ ] Gateway, serving manager and agent runtime OpenAPI docs reference it for 4xx/5xx\n- [ ] Gateway agent proxy no longer forwards `{detail}` bodies; a test asserts the mapped shape\n- [ ] Contract test validates sample error bodies from each service against the schema"
+  },
+  {
+    "title": "Specify the agent runtime /invoke and /healthz HTTP contract, including X-MLAIOps headers",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:agent-runtime"
+    ],
+    "body": "## Problem\nThe gateway and agent runtime agree on `/invoke` only by coincidence of two hand-written types: `InvokeRequest`/`InvokeResponse` in `agent-runtime/agent_runtime/app.py:40-53` and `api.InvokeAgentRequest` in `platform/go/pkg/api/types.go:666-670`. The routing headers `X-MLAIOps-Graph-Module`, `X-MLAIOps-Agent-ID`, `X-MLAIOps-Agent-Name` are set in `platform/go/internal/httpapi/server.go:1318-1322` and read in `app.py:63-68`, where a mismatch yields 409. The `/healthz` body (`app.py:126-128`: `framework`, `streaming_mode`) is consumed by `agentRuntimeReady` (`server.go:1324`) but documented nowhere. Third parties building a runtime have no spec to implement.\n\n## Proposal\nAdd `openapi/agent-runtime/v1.yaml` covering `GET /healthz`, `POST /invoke` and `POST /stream`, with header parameters, the 409 entrypoint-mismatch case and the 502 execution failure. Mark `usage_available` semantics (token counts are 0 when false).\n\n## Acceptance criteria\n- [ ] OpenAPI document lists all three endpoints with request, response and header schemas\n- [ ] 409 and 502 responses are documented with the shared error schema\n- [ ] agent-runtime CI validates FastAPI's generated schema (`app.openapi()`) against the contracts file\n- [ ] Gateway test asserts the request it sends to `/invoke` validates against the contract"
+  },
+  {
+    "title": "Define a typed SSE event schema for agent runtime /stream",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:agent-runtime"
+    ],
+    "body": "## Problem\n`POST /stream` in `agent-runtime/agent_runtime/app.py:178-218` emits untyped `data:` frames with no `event:` field. Consumers must guess the frame kind from which keys exist: a first frame `{streaming_mode}` (`app.py:186`), deltas `{delta}` (`app.py:198`), an optional `{error}` (`app.py:201`), then always a terminal `{done: true, usage_available, session_id, input_tokens, output_tokens, cost_usd, duration_ms}` (`app.py:204-218`), even after an error. An error frame followed by `done` is ambiguous about success.\n\n## Proposal\nAdd `agent-runtime/stream-event.v1.schema.json` as a `oneOf` discriminated by a `type` field (`start`, `delta`, `error`, `done`), and set the SSE `event:` line to the same value. Include `status: succeeded|failed` in `done`. Document ordering rules (one `start`, zero or more `delta`, at most one `error`, exactly one `done`).\n\n## Acceptance criteria\n- [ ] Schema with four event variants and a required `type` discriminator\n- [ ] Ordering rules documented next to the schema\n- [ ] Fixture stream files (valid and invalid) under `agent-runtime/examples/`\n- [ ] agent-runtime test parses its own `/stream` output and validates every frame against the schema"
+  },
+  {
+    "title": "Publish a JSON Schema for pipeline step reports sent by the runner",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:runner"
+    ],
+    "body": "## Problem\nThe runner reports step transitions with `report_step` in `pipeline-runner/pipelines/report.py:20-39`, building a payload from `**facts` kwargs with no validation. The receiving type is `api.UpdateRunStepRequest` (`platform/go/pkg/api/types.go:254-265`). Allowed statuses (`pending, running, succeeded, failed, skipped`) are enforced only in `validStepStatus` (`platform/go/internal/store/store.go:358-363`). `at` is described as ISO-8601 UTC only in a docstring (`report.py:21-22`). A typo in a kwarg name reaches the gateway as an unknown field.\n\n## Proposal\nAdd `runner/step-report.v1.schema.json` with `status` as an enum, `exit_code` as nullable integer, `at` as `date-time`, `workload_kind` as an enum (`docker-container`, `k8s-job`, `k8s-pod`, `openfaas-call` per `types.go:279-281`). Reference it from the gateway OpenAPI operation `POST /api/v1/pipelines/runs/{id}/steps`.\n\n## Acceptance criteria\n- [ ] Schema exists with enums for `status` and `workload_kind`\n- [ ] Valid and invalid fixtures under `runner/examples/step-report/`\n- [ ] pipeline-runner test validates every payload `report_step` builds against the schema\n- [ ] Gateway OpenAPI references the schema for the steps endpoint"
+  },
+  {
+    "title": "Publish a JSON Schema for runner log ingest batches with documented limits",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:runner"
+    ],
+    "body": "## Problem\n`LogShipper` in `pipeline-runner/pipelines/report.py:54-112` posts `{entries: [...]}` to `POST /api/v1/pipelines/runs/{id}/logs`, hardcoding `workload_kind: docker-container` (`report.py:75-76`) and chunking at 500 (`report.py:88`). The gateway side (`platform/go/pkg/api/pipelines.go:63-78`, handler `platform/go/internal/httpapi/logs.go:102-141`) enforces limits that exist only in code: 500 entries (`logs.go:29`), 8 KiB message truncation (`logs.go:30`), 4 MiB body (`logs.go:109`), and silently rewrites unknown severities to `info`/`warn` (`logs.go:119-125`). The endpoint is missing from OpenAPI.\n\n## Proposal\nAdd `runner/log-batch.v1.schema.json` with `maxItems: 500`, `severity` enum (`debug, info, warn, error`), `stream` enum (`stdout, stderr`), `ts` as `date-time`, and document truncation and severity fallback as normative behaviour. Make `workload_kind` share the enum from the step report schema.\n\n## Acceptance criteria\n- [ ] Schema encodes entry count, field types and enums\n- [ ] Normative notes describe truncation at 8 KiB, 4 MiB body limit and severity fallback\n- [ ] pipeline-runner test validates `LogShipper` batches against the schema\n- [ ] Gateway OpenAPI documents the 202 `{accepted}` and 413 `too_many_entries` responses"
+  },
+  {
+    "title": "Set one unknown-field policy for internal ingest endpoints so newer clients do not break",
+    "labels": [
+      "reliability",
+      "P1",
+      "area:governance"
+    ],
+    "body": "## Problem\nThe gateway's `decode` helper calls `DisallowUnknownFields` (`platform/go/internal/httpapi/server.go:1566-1569`) and is used for step reports (`server.go:536`) and traces (`server.go:1467`). Log ingest uses a plain decoder that accepts unknown fields (`logs.go:109`). `UpdateRunStepRequest` comments that new facts are \"optional for older runners\" (`platform/go/pkg/api/types.go:257`), but the reverse direction fails: a newer runner sending a field an older gateway lacks gets HTTP 400, and `report_step` only prints the error (`pipeline-runner/pipelines/report.py:38-39`), so step state is silently lost.\n\n## Proposal\nWrite `docs/compatibility.md` in contracts stating the rule per contract class: producer-to-gateway ingest payloads are open (`additionalProperties` allowed and ignored), user-authored documents (pipeline YAML) stay closed. Encode it in each schema and add a conformance fixture with an extra field.\n\n## Acceptance criteria\n- [ ] `docs/compatibility.md` defines open versus closed contracts with examples\n- [ ] Step report, log batch and trace schemas declare their policy explicitly\n- [ ] Fixture `step-report/extra-field.json` is accepted by the gateway (platform test)\n- [ ] Breaking-change CI treats tightening `additionalProperties` as breaking"
+  },
+  {
+    "title": "Define the LLM trace event schema and fix trace-proxy README claims",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:events"
+    ],
+    "body": "## Problem\ntrace-proxy publishes `traceproxy.Event` (`trace-proxy/internal/traceproxy/proxy.go:13-21`) to `mlaiops.llm.traces` via Kafka REST (`proxy.go:57-71`, configured in `deploy/compose.yaml:382-383`). The README says traces carry \"prompt, response, timing, token usage\" (`trace-proxy/README.md:4-6`), but the struct has none of prompt, response or tokens, and `Model` is never populated (`proxy.go:91`). The same proxy can also POST the event to an HTTP sink (`proxy.go:30-47`) whose expected shape is undefined. There is no schema for downstream consumers.\n\n## Proposal\nAdd `events/llm-trace.v1.schema.json` describing the fields actually emitted, with `schema_version`, and a roadmap note for token usage fields. Correct the README to match. Include the Kafka REST envelope (`{records:[{value}]}`) in the AsyncAPI document.\n\n## Acceptance criteria\n- [ ] Schema matches `traceproxy.Event` exactly, including `model` as optional\n- [ ] trace-proxy test validates an emitted event against the schema\n- [ ] README no longer claims fields the event does not contain\n- [ ] Event includes a `schema_version` field"
+  },
+  {
+    "title": "Specify the agent session report contract for POST /api/v1/traces",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:agent-runtime"
+    ],
+    "body": "## Problem\nThe agent runtime reports each turn via `report_session` (`agent-runtime/agent_runtime/reporting.py:44-71`) which calls `mlaiops_sdk.tracing.record_trace` (`sdk-python/mlaiops_sdk/tracing.py:170-187`). The gateway decodes it into `api.RecordTraceRequest` (`platform/go/pkg/api/types.go:617-629`) with unknown fields rejected (`server.go:1467`). `record_trace` never calls `raise_for_status` (`tracing.py:179-184`), so a 400 from a field mismatch is invisible. The payload keys are typed in three places with no shared definition.\n\n## Proposal\nAdd `agent-runtime/session-report.v1.schema.json`, reference it from the gateway OpenAPI operation, and add a conformance test in agent-runtime that validates the dict passed to `record_trace`.\n\n## Acceptance criteria\n- [ ] Schema with required fields, `status` enum (`succeeded`, `failed`) and integer token counts\n- [ ] agent-runtime test validates `report_session` output against the schema\n- [ ] sdk-python logs (at debug) non-2xx responses from `/api/v1/traces`\n- [ ] Gateway OpenAPI references the schema"
+  },
+  {
+    "title": "Document all Kafka topics and payloads in an AsyncAPI 3.0 document",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:events"
+    ],
+    "body": "## Problem\n`deploy/scripts/local-topics.sh:6-22` creates 15 topics (`mlaiops.audit.operations`, `mlaiops.*.commands`, `mlaiops.llm.traces`, `mlaiops.feature.updates`, demo topics). Producers are the transactional outbox in `platform/go/internal/store/postgres.go:715-740` and `documents.go:256-266`, routed by `topicForAction` (`postgres.go:828-846`); the consumer is the integration worker (`platform/go/cmd/integration-worker/main.go:71`). Which topic carries which payload, its key, and who consumes it is only discoverable by reading code.\n\n## Proposal\nAdd `asyncapi/kionga.v1.yaml` (AsyncAPI 3.0) listing every channel with message schema `$ref`s into `events/`, the message key (`resource_id` for outbox events), producers and consumers. Generate the topic list in `local-topics.sh` from it or test that they match.\n\n## Acceptance criteria\n- [ ] AsyncAPI document validates with `asyncapi validate` in CI\n- [ ] Every topic in `local-topics.sh` has a channel, or is marked as demo-only\n- [ ] Each channel lists producer and consumer components\n- [ ] A test fails when `local-topics.sh` and the AsyncAPI channel list diverge"
+  },
+  {
+    "title": "Version the lifecycle command envelope and type per-kind resource payloads",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:events"
+    ],
+    "body": "## Problem\nCommand events are built as an ad hoc `map[string]any` with no version (`platform/go/internal/store/postgres.go:729-732`: `id, kind, action, resource, actor, tenant, occurred_at`). The consumer's `LifecycleCommand` (`platform/go/internal/integrations/dispatcher.go:19-25`) ignores `actor` and `occurred_at`, and reads `resource` as `map[string]any`, pulling `name`, `project_id`, `version`, `stage`, `graph_module`, `autoscaling.min_replicas` by string key (`dispatcher.go:42-70`). Renaming a JSON tag on `api.Agent` silently produces CRDs with nil fields.\n\n## Proposal\nAdd `events/lifecycle-command.v1.schema.json` with a required `schema_version`, and per-`kind` resource schemas (`pipeline_run`, `model`, `agent`, `tool`, `connection`) selected by `if/then` on `kind`. Generate Go structs for the consumer instead of map lookups.\n\n## Acceptance criteria\n- [ ] Envelope schema with `schema_version`, `kind` enum and `action` pattern\n- [ ] Resource schemas for each `kind` the dispatcher handles\n- [ ] Producer test validates each outbox command payload against the schema\n- [ ] Dispatcher decodes into typed structs and has a fixture test per kind"
+  },
+  {
+    "title": "Define the audit event schema and align its two producers",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:events"
+    ],
+    "body": "## Problem\n`api.AuditEvent` (`platform/go/pkg/api/types.go:680-688`) is written to `mlaiops.audit.operations` from two code paths: `auditTx` in `platform/go/internal/store/documents.go:256-266`, which never sets `Metadata`, and the Postgres outbox path in `postgres.go:716-726`, which does. Audit consumers (SIEM, log export) cannot rely on field presence, and `action` values (`pipeline.*`, `model.promoted`, ...) are an open string set.\n\n## Proposal\nAdd `events/audit-event.v1.schema.json` with `action` constrained by a pattern `^[a-z_]+\\.[a-z_]+$` and a documented action registry, `actor` required (defaulting to `anonymous` as in `actorOrAnonymous`), and `metadata` always present (possibly empty).\n\n## Acceptance criteria\n- [ ] Schema and `docs/audit-actions.md` listing every action emitted today\n- [ ] Both producers emit `metadata` as an object\n- [ ] Platform test validates events from both code paths against the schema\n- [ ] AsyncAPI channel `mlaiops.audit.operations` references the schema"
+  },
+  {
+    "title": "Write an OpenAPI contract for the serving manager API",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:serving"
+    ],
+    "body": "## Problem\nThe serving manager exposes `GET /healthz`, `GET /deployments`, `POST /deployments`, `DELETE /deployments/{name}` (`serving/cmd/serving-manager/main.go:41-88`), with the request body as an anonymous struct (`main.go:61-65`) and the `Deployment` type in `serving/internal/serving/manager.go:53-59`. The gateway duplicates the request struct by hand (`platform/go/internal/httpapi/server.go:1147-1151`) and decodes only `endpoint` from the 201 (`server.go:1170-1175`). The server uses `DisallowUnknownFields` (`main.go:67`), so adding a field on the gateway side first breaks deploys.\n\n## Proposal\nAdd `openapi/serving-manager/v1.yaml` covering all four operations, bearer auth via `MLAIOPS_INTERNAL_TOKEN`, and the 401/400/422/502 responses. Generate the Go client used by the gateway and the server types from it.\n\n## Acceptance criteria\n- [ ] OpenAPI document with request and response schemas for all four operations\n- [ ] Gateway uses a generated client instead of the inline struct\n- [ ] serving CI checks its handlers against the document with a request/response test\n- [ ] Deploy order note: server must ship field additions before the gateway sends them"
+  },
+  {
+    "title": "Specify the feature store online lookup and adapter contract",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:features"
+    ],
+    "body": "## Problem\nThe adapter contract is a Go interface (`platform/go/internal/feature/adapter.go:50-56`) with health states as constants (`adapter.go:17-22`). The online lookup wire format is `Request{feature_service, entities: [map]}` / `Response{results: [{values, statuses}]}` (`platform/go/internal/feature/service.go:9-21`), with statuses `PRESENT`/`NOT_FOUND` as literals (`service.go:74-77`). The same path `/get-online-features` is used with Feast's incompatible columnar shape (`feast.go:30-31,65`), and the Python SDK posts the Kionga shape (`sdk-python/mlaiops_sdk/agents.py:194-197`). Pointing `FEATURE_GATEWAY` at a Feast server fails at runtime with no contract to say why.\n\n## Proposal\nAdd `openapi/feature-gateway/v1.yaml` for `/healthz` and `/get-online-features` (Kionga shape), a `features/adapter.md` describing the Go `Adapter` semantics (capabilities, `ErrNotSupported`, health states), and a `features/capabilities.schema.json` matching `api.FeatureStoreCapabilities`.\n\n## Acceptance criteria\n- [ ] OpenAPI document with `statuses` as an enum\n- [ ] Adapter doc lists required versus optional operations and error semantics\n- [ ] `platform/go/cmd/feature-gateway` tests validate responses against the document\n- [ ] SDK README states the endpoint is the Kionga feature gateway, not Feast"
+  },
+  {
+    "title": "Define the feature materialization report schema and retire the /materialized fallback",
+    "labels": [
+      "refactor",
+      "P3",
+      "area:features"
+    ],
+    "body": "## Problem\n`agent-runtime/features/materialize.py:95-117` posts to `/api/v1/features/{view}/materializations` and, on 404/405, falls back to the older `/api/v1/features/{view}/materialized` with only `entity_count`. The new payload maps to `api.ReportFeatureMaterializationRequest` (`platform/go/pkg/api/feature_stores.go:111-119`) where `status` is a free string and `view_version` is optional. Neither endpoint version is documented, and there is no date for removing the fallback.\n\n## Proposal\nAdd `features/materialization-report.v1.schema.json` (`status` enum `succeeded|failed`, `error` required when failed) and mark `POST /features/{name}/materialized` as `deprecated: true` in the gateway OpenAPI with a removal version per the deprecation policy.\n\n## Acceptance criteria\n- [ ] Schema with conditional `error` requirement\n- [ ] Gateway OpenAPI marks the old endpoint deprecated with a `x-sunset` version\n- [ ] agent-runtime test validates the payload it builds\n- [ ] Fallback is removed in the release named in the deprecation entry"
+  },
+  {
+    "title": "Close gaps between the pipeline JSON Schema and the Go validator",
+    "labels": [
+      "bug",
+      "P2",
+      "area:pipeline"
+    ],
+    "body": "## Problem\nThe schema and `platform/go/internal/pipelinespec/validate.go` disagree on rules a schema can express:\n- Go uses one quantity regex for CPU and memory (`validate.go:39`), so `cpu: 2Gi` passes Go but fails the schema's split patterns (`pipeline/v1.schema.json:91-92`).\n- Go requires `when.param` to match the parameter name pattern (`validate.go:171-172`); the schema accepts any string (`v1.schema.json:110`).\n- Go rejects container nodes when `executionMode: functions` and function nodes under `prefect` (`validate.go:141,148`); the schema allows both.\n- The schema permits `cron`/`timezone` on non-schedule triggers (`v1.schema.json:51-57`).\nEditors show green for documents the API rejects.\n\n## Proposal\nTighten the schema with `if/then` on `executionMode`, a `when.param` pattern, and `not` rules for schedule-only fields; split the Go regex into CPU and memory forms to match. Add a parity test fixture for each rule.\n\n## Acceptance criteria\n- [ ] Schema rejects mismatched node type and `executionMode`\n- [ ] `when.param` and resource patterns are identical in schema and Go\n- [ ] One negative fixture per rule, rejected by both pytest and `pipelinespec` tests\n- [ ] Change is released as a minor version with a changelog entry noting the tightening"
+  },
+  {
+    "title": "Document the pipeline semantic rules the schema cannot express",
+    "labels": [
+      "docs",
+      "P2",
+      "area:pipeline"
+    ],
+    "body": "## Problem\nThe only description of semantic rules is one sentence in the schema `description` (`pipeline/v1.schema.json:5`) and a paragraph in `README.md:14-17`. The real rules in `platform/go/internal/pipelinespec/validate.go:84-232` include more: unique node ids, missing and self dependencies, duplicate entries in `dependsOn`, cycle detection reported as a path (`validate.go:194-195`), declared overridable parameters, default `UTC` timezone and default container resources `500m`/`1Gi` (`validate.go:131-136,220-222`). Defaults applied by the server are invisible to schema users.\n\n## Proposal\nAdd `pipeline/v1.semantics.md` listing each rule with an id (e.g. `PIPE-001`), the issue `path` it reports, the Go message, and a fixture. Add `default` keywords in the schema for server-applied defaults.\n\n## Acceptance criteria\n- [ ] Every check in `Validate` maps to a numbered rule in the doc\n- [ ] Server-applied defaults appear as `default` in the schema\n- [ ] Each rule links to a negative fixture under `pipeline/examples/invalid/`\n- [ ] README links the semantics doc instead of restating rules"
+  },
+  {
+    "title": "Add a shared corpus of negative pipeline fixtures with expected issues",
+    "labels": [
+      "testing",
+      "P2",
+      "area:pipeline"
+    ],
+    "body": "## Problem\nNegative cases exist only as Python lambdas in `tests/test_pipeline_schema.py:25-33`, which Go cannot reuse. On the Go side, most tests mutate an inline copy `branchedYAML` (`platform/go/internal/pipelinespec/spec_test.go:12`) and only `TestSharedExampleIsValid` (`spec_test.go:184-197`) reads the shared file. The two sides can drift on rejections while agreeing on the single valid example.\n\n## Proposal\nAdd `pipeline/examples/invalid/<case>.kionga.yaml` plus `<case>.expected.json` listing expected issue paths and whether the schema, the Go validator, or both must reject it. Add more valid examples (functions mode, event trigger, manual-only). Drive pytest and a Go table test from the directory.\n\n## Acceptance criteria\n- [ ] At least 15 invalid and 4 valid fixtures checked in\n- [ ] pytest iterates the directory instead of inline lambdas\n- [ ] A `pipelinespec` test iterates the same directory and checks expected `path` values\n- [ ] Adding a fixture requires no test code change"
+  },
+  {
+    "title": "Detect breaking contract changes in CI with oasdiff and a JSON Schema diff",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\n`contracts/.github/workflows/ci.yml:9-12` only calls a shared Python workflow (pytest and ruff). Nothing compares a change against the last release, so a pull request that removes an enum value or adds a required field to `pipeline/v1.schema.json` passes CI, despite the README rule that breaking changes need a new file (`README.md:28-31`).\n\n## Proposal\nAdd a CI job that checks out the latest `v*` tag and runs `oasdiff breaking --fail-on ERR` on each OpenAPI file and a JSON Schema compatibility check (e.g. `json-schema-diff` or a small checker for removed properties, new `required`, narrowed enums/patterns, tightened `additionalProperties`) on each `*.schema.json`. Allow an override only with a `breaking-change` label plus a new major file.\n\n## Acceptance criteria\n- [ ] Job fails on a test PR that removes `\"api\"` from the trigger `type` enum\n- [ ] Job fails on a removed OpenAPI response field\n- [ ] Report is posted as a PR comment listing each breaking change\n- [ ] Override path documented in `CONTRIBUTING.md`"
+  },
+  {
+    "title": "Lint every schema and API document in CI",
+    "labels": [
+      "testing",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\nThe only check on `pipeline/v1.schema.json` is that one example validates (`tests/test_pipeline_schema.py:21-22`). Nothing verifies the schema against the 2020-12 meta-schema, that `$id` values are unique and match the published URL, or that each schema has at least one example. As OpenAPI, AsyncAPI and more JSON Schemas are added, malformed `$ref`s will only surface in consumers.\n\n## Proposal\nAdd a lint job: `check-jsonschema --check-metaschema` on every `*.schema.json`, `redocly lint` / `spectral lint` for OpenAPI, `asyncapi validate` for AsyncAPI, and a pytest that asserts every schema has an `examples/` entry and a unique `$id` under `https://kionga.dev/schemas/`.\n\n## Acceptance criteria\n- [ ] Meta-schema validation for all JSON Schemas\n- [ ] OpenAPI and AsyncAPI linters with a checked-in ruleset\n- [ ] Test enforcing unique `$id` and one example per schema\n- [ ] Lint runs on every PR and blocks merge"
+  },
+  {
+    "title": "Write a schema versioning and deprecation policy",
+    "labels": [
+      "docs",
+      "P2",
+      "area:governance"
+    ],
+    "body": "## Problem\n`README.md:28-31` has three sentences on versioning: tags are semver and a breaking change gets a new file. It does not define what counts as breaking (new enum value, narrowed pattern, new required field, response field removal), how repo tags relate to per-contract versions (`pipeline/v1` versus `v1.0.0`), how long a deprecated version is supported, or how to mark deprecation in each format.\n\n## Proposal\nAdd `docs/versioning.md` with a change classification table per format (JSON Schema, OpenAPI, AsyncAPI event), the relation between repo semver and per-contract major versions, a minimum support window for the previous major, and markers (`deprecated: true`, `x-sunset`, schema `deprecated` keyword).\n\n## Acceptance criteria\n- [ ] Table classifies at least 12 change types as patch, minor or major\n- [ ] Support window for previous major is stated in releases, not dates only\n- [ ] Deprecation markers specified for each document format\n- [ ] Breaking-change CI rules reference this document"
+  },
+  {
+    "title": "Add a release process and CHANGELOG, and pin the platform submodule to tags",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:governance"
+    ],
+    "body": "## Problem\nThe repo has one tag, `v1.0.0`, and no `CHANGELOG`. The platform pins the submodule at `d808c22` (`git submodule status` shows `v1.0.0-2-gd808c22`), an untagged commit. `ci.yml:6` triggers on `v*` tags but runs the same tests and publishes nothing. Consumers cannot tell what changed between pins.\n\n## Proposal\nAdopt Keep a Changelog format in `CHANGELOG.md`, require a changelog entry per PR touching a contract (CI check), and add a release workflow on `v*` tags that creates a GitHub Release with the changelog section and attaches bundled schemas. Add a platform CI check that the submodule commit equals a tag.\n\n## Acceptance criteria\n- [ ] `CHANGELOG.md` with an entry for `v1.0.0` and unreleased changes\n- [ ] PRs changing `pipeline/`, `openapi/`, `events/` fail without a changelog entry\n- [ ] Tag push creates a GitHub Release with schema artifacts\n- [ ] Platform CI fails when `contracts` is not at a tagged commit"
+  },
+  {
+    "title": "Serve schemas at their $id URLs via GitHub Pages",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:publishing"
+    ],
+    "body": "## Problem\nThe schema declares `$id: https://kionga.dev/schemas/pipeline/v1.json` (`pipeline/v1.schema.json:3`), but nothing in this repo publishes there, and the filename differs (`v1.schema.json`). The README tells editors to use a `raw.githubusercontent.com` URL pinned to `v1.0.0` instead (`README.md:25`). Tools that resolve `$id` or `$ref` by URL cannot fetch the schema, and the two URLs will diverge once `$ref`s across files are introduced.\n\n## Proposal\nAdd a Pages workflow that, on each release tag, publishes `schemas/<contract>/v<major>.json` (latest minor) and `schemas/<contract>/<semver>/v<major>.json` (immutable) under `kionga.dev`, with correct `Content-Type: application/schema+json` where supported. Update the README to use the `$id` URL.\n\n## Acceptance criteria\n- [ ] `https://kionga.dev/schemas/pipeline/v1.json` returns the released schema\n- [ ] Immutable per-version URLs exist for every tag\n- [ ] A CI test asserts each file's `$id` matches its published path\n- [ ] README editor snippet uses the `$id` URL"
+  },
+  {
+    "title": "Register *.kionga.yaml in SchemaStore and add editor setup docs",
+    "labels": [
+      "dx",
+      "P3",
+      "area:editor"
+    ],
+    "body": "## Problem\nUsers must add a `# yaml-language-server: $schema=...` comment to each file to get validation (`README.md:23-26`). Pipeline files use the `*.kionga.yaml` suffix (`pipeline/examples/branched.kionga.yaml`), which is a good fit for automatic association, but no SchemaStore catalog entry or VS Code/JetBrains settings are provided. The schema also lacks `markdownDescription` and `examples` for hover help; most properties have no description at all.\n\n## Proposal\nSubmit a SchemaStore catalog entry mapping `*.kionga.yaml` and `*.kionga.yml` to the published `$id` URL. Add `docs/editors.md` with VS Code (`yaml.schemas`), JetBrains and Neovim snippets. Add `description` and `examples` to every property in `v1.schema.json`.\n\n## Acceptance criteria\n- [ ] SchemaStore PR merged with the file pattern\n- [ ] `docs/editors.md` covers three editors\n- [ ] Every schema property has a `description`; a lint test enforces it\n- [ ] Opening the example in VS Code with the YAML extension shows hover text with no manual comment"
+  },
+  {
+    "title": "Generate Go types for pipelinespec and pkg/api from contracts",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:codegen"
+    ],
+    "body": "## Problem\nThe pipeline document shape is hand-written twice: the JSON Schema and `Document`/`DocNode` in `platform/go/internal/pipelinespec/spec.go:30-109`. Limits are duplicated as Go constants (`validate.go:44-49`: `MaxNodes=200`, `MaxRetries=10`, ...) and as schema keywords (`v1.schema.json:77-78,100-101`). Wire types in `platform/go/pkg/api/*.go` are the de facto API spec. Any edit to one side requires a manual edit to the other.\n\n## Proposal\nAdd a `go/` module to contracts with types generated from the JSON Schemas (`go-jsonschema` or `omissis/go-jsonschema`) and from OpenAPI (`oapi-codegen` types-only), plus generated constants for numeric limits. Commit generated code and add a CI check that regeneration yields no diff. Migrate `pipelinespec` to embed the generated structs.\n\n## Acceptance criteria\n- [ ] `make generate` in contracts produces Go types and constants\n- [ ] CI fails if generated files are stale\n- [ ] `pipelinespec` uses generated constants instead of `MaxNodes` and friends\n- [ ] Module is importable as `github.com/kiongahq/contracts/go`"
+  },
+  {
+    "title": "Generate Python models from contracts and replace hand-written SDK models",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:codegen"
+    ],
+    "body": "## Problem\n`sdk-python/mlaiops_sdk/models.py:51-73` hand-codes `PipelineRun`. It is missing `trigger`, `scheduled_for`, `provenance` and `owner_subject` that the Go type returns (`platform/go/pkg/api/types.go:212-219`), and types `steps` and `logs` as `list[dict]` instead of `PipelineStep`/`RunLog`. The pipeline runner and agent runtime build gateway payloads as plain dicts (`pipeline-runner/pipelines/report.py:29-30,75-76`, `agent-runtime/agent_runtime/reporting.py:57-71`).\n\n## Proposal\nAdd a `python/` package `kionga-contracts` generated with `datamodel-code-generator` (Pydantic v2) from every JSON Schema and OpenAPI component. Publish it on release. Migrate the SDK models, runner reporter and agent session reporter to it.\n\n## Acceptance criteria\n- [ ] `make generate` produces Pydantic models; CI checks for a clean diff\n- [ ] Package is built and published on `v*` tags\n- [ ] `PipelineRun` in the SDK is the generated model and includes the four missing fields\n- [ ] Runner `report_step` builds its payload through the generated model"
+  },
+  {
+    "title": "Ship a consumer conformance kit for Go and Python",
+    "labels": [
+      "testing",
+      "P2",
+      "area:conformance"
+    ],
+    "body": "## Problem\nThe only cross-repo check reads a file by relative path through the submodule (`platform/go/internal/pipelinespec/spec_test.go:185`: `../../../contracts/pipeline/examples/branched.kionga.yaml`). Repos that do not vendor the submodule (pipeline-runner, agent-runtime, trace-proxy, serving) have no way to prove their payloads match a contract, and each would have to reinvent fixture loading.\n\n## Proposal\nPublish fixtures and helpers: Go package `github.com/kiongahq/contracts/go/conformance` with `//go:embed` fixtures and `Validate(contract, payload)`; Python `kionga_contracts.conformance` with the same API and a pytest plugin that parametrizes over valid and invalid fixtures. Document a one-test recipe per consumer.\n\n## Acceptance criteria\n- [ ] Go and Python packages expose fixtures by contract name and version\n- [ ] `Validate` returns structured errors with JSON pointer paths\n- [ ] platform `TestSharedExampleIsValid` uses the Go kit instead of a relative path\n- [ ] pipeline-runner and agent-runtime each add one conformance test using the kit"
+  },
+  {
+    "title": "Define a schema for the /api/v1/events SSE digest and log stream",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:openapi"
+    ],
+    "body": "## Problem\n`GET /api/v1/events` (`platform/go/internal/httpapi/server.go:782-805`) sends a JSON digest every 3 seconds as unnamed `data:` frames; the digest shape is whatever `digestFor` returns, with no schema or event name. `GET /api/v1/logs/stream` (`logs.go:24`) is not in OpenAPI at all. OpenAPI 3.x cannot describe SSE frames, so the console relies on code knowledge.\n\n## Proposal\nAdd `events/sse-digest.v1.schema.json` and `events/log-stream.v1.schema.json`, reference them from the OpenAPI operations via `text/event-stream` media type with `x-sse-event-schema`, and emit an `event:` line naming the frame type.\n\n## Acceptance criteria\n- [ ] Both schemas exist with examples\n- [ ] OpenAPI operations reference them under `text/event-stream`\n- [ ] Gateway test validates a captured frame from each stream\n- [ ] Frames carry an `event:` name"
+  },
+  {
+    "title": "Make the pipeline validation issue format a published contract",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:pipeline"
+    ],
+    "body": "## Problem\n`POST /api/v1/pipelines/validate` returns `{valid, issues, request}` (`platform/go/internal/httpapi/pipeline_definitions.go`, `validationResponse`) where each issue is `{path, node, line, message}` (`platform/go/internal/pipelinespec/validate.go:16-21`). Editors, the CLI and CI tooling in user repos parse it, but it is undocumented and missing from OpenAPI, and `path` uses a dotted format (`spec.nodes[0].id`) that differs from JSON Schema error paths (JSON pointer).\n\n## Proposal\nAdd `pipeline/validation-result.v1.schema.json`, document the path syntax, and include a stable `rule` id per issue tied to the semantics doc. Reference it from the OpenAPI operation.\n\n## Acceptance criteria\n- [ ] Schema for the response with `rule`, `path`, `node`, `line`, `message`\n- [ ] Path syntax documented with examples and a mapping to JSON pointer\n- [ ] Negative fixtures' expected files use this format\n- [ ] Gateway test validates its validate-endpoint responses against the schema"
+  },
+  {
+    "title": "Fix README CLI name and stale consumer table",
+    "labels": [
+      "docs",
+      "P3",
+      "area:docs"
+    ],
+    "body": "## Problem\n`README.md:16` tells users to run `kionga pipeline validate`, but the CLI binary and usage text are `mlaiops pipeline validate` (`platform/go/cmd/cli/main.go:99,104`). The contract table (`README.md:6-8`) lists only the pipeline definition and says nothing about the other boundaries this repo is meant to own. The README also refers to the platform submodule path as `contracts/` while describing Go tests that read it by relative path.\n\n## Proposal\nCorrect the command name (or alias `kionga` in the CLI and document both), and expand the table into an index of every contract with status (`stable`, `draft`, `planned`), owner and consumers, linking to the AsyncAPI/OpenAPI files as they land.\n\n## Acceptance criteria\n- [ ] README command matches the shipped CLI\n- [ ] Table lists every contract with status, owner and consumers\n- [ ] A test or link checker fails on README links to missing files\n- [ ] `CODEOWNERS` assigns each contract directory to its consuming team"
+  }
+]

@@ -1,0 +1,290 @@
+[
+  {
+    "title": "Warn that the local stack publishes services on all interfaces with default credentials",
+    "labels": [
+      "security",
+      "P1",
+      "area:getting-started"
+    ],
+    "body": "## Problem\n`deploy/compose.yaml` publishes the gateway (`${GATEWAY_PORT:-8080}:8080`) and the data services (Postgres, Redis, Kafka, the RustFS object store) on every host interface, so they are reachable from the local network, and they use the default credentials listed in `docs/getting-started/installation.md`. `MLAIOPS_ALLOWED_ORIGIN` defaults to `*` (`docs/getting-started/configuration.md`). The \"private local stack\" note in `docs/index.md` does not say that anyone on the same network can reach Postgres and the object store with those defaults.\n\n`docs/getting-started/configuration.md` also suggests `MLAIOPS_LOCAL_ROLE` applies to unauthenticated local API requests. Measured on the current gateway, unauthenticated `/api/*` calls return 401 (the sign-in middleware runs before RBAC), so that row describes the role of the local login, not anonymous access.\n\n## Proposal\n- Add a warning admonition to `installation.md` and `quickstart.md`: which ports are published on all interfaces, which credentials are defaults, and how to bind to loopback only (a Compose override or the bind-address variable proposed in kiongahq/deploy).\n- Correct the `MLAIOPS_LOCAL_ROLE` and `MLAIOPS_ALLOWED_ORIGIN` rows to describe their real effect.\n\n## Acceptance criteria\n- [ ] `installation.md` lists every published port and its default credential.\n- [ ] A tested loopback-only override is documented, with `curl http://<lan-ip>:5432` (or `nc`) from another host shown as the check.\n- [ ] `configuration.md` no longer implies anonymous API calls run with `MLAIOPS_LOCAL_ROLE`.\n- [ ] The note in `docs/index.md` links to the warning."
+  },
+  {
+    "title": "Replace live-volume tar backups with consistent, complete backup steps",
+    "labels": [
+      "reliability",
+      "P1",
+      "area:operations"
+    ],
+    "body": "## Problem\n`docs/operations/local.md:100-110` tells readers to back up by running `tar czf` over `mlaiops_postgres-data` and `mlaiops_objectstore-data` while the stack is running. Copying a live PostgreSQL data directory can produce a backup that will not restore. The page says \"All durable state is in Postgres ... and the RustFS object store\", but `docs/getting-started/installation.md:116-118` lists `jupyter-data` (notebooks and project source) and `prefect-data` as durable. `deploy/compose.yaml:509-516` also defines `workspace-codex` and `workspace-claude`. None of these are in the backup. The page has no restore procedure.\n\n## Proposal\n- Use `pg_dumpall` through `docker compose exec postgres`, or stop the stack before archiving volumes.\n- Back up every named volume in `deploy/compose.yaml`, or explain why a volume is excluded.\n- Add a tested restore section and a check that the restore worked (for example, project count through `/api/v1/projects`).\n\n## Acceptance criteria\n- [ ] The backup procedure never archives a running PostgreSQL data directory.\n- [ ] `jupyter-data` and `prefect-data` are included or explicitly excluded with a reason.\n- [ ] A restore section exists and was run once against a fresh stack.\n- [ ] `local.md` and `installation.md` give the same list of durable volumes."
+  },
+  {
+    "title": "Require a backup before every documented `down -v` reset",
+    "labels": [
+      "reliability",
+      "P1",
+      "area:operations"
+    ],
+    "body": "## Problem\nThe fix for \"Everything is broken after an update\" in `docs/operations/troubleshooting.md:157-163` is `docker compose -f deploy/compose.yaml down -v`. That command deletes PostgreSQL, object storage, notebooks, and IDE workspaces. The section offers no diagnosis first and no backup. A reader with a real problem after `make -C deploy workspace-pull` will lose all projects, models, and notebooks. `docs/operations/local.md:114-118` has the same command without a backup step. This also conflicts with `docs/operations/public-vm.md:96`, which says not to use `down -v` for troubleshooting.\n\n## Proposal\n- Rewrite the section to list non-destructive steps first: `make -C deploy local-status`, `local-logs`, `local-rebuild`, and running the gateway migrations.\n- Keep `down -v` only as a last resort, after a required backup step that links to the backup section in `local.md`.\n- Label both destructive blocks with a `danger` admonition.\n\n## Acceptance criteria\n- [ ] `troubleshooting.md` gives at least three non-destructive recovery steps before any reset.\n- [ ] Every `down -v` block in the docs follows a backup step and sits inside a `danger` admonition.\n- [ ] The guidance matches `public-vm.md:96`.\n- [ ] `grep -rn 'down -v' docs/` returns only commands that meet these rules."
+  },
+  {
+    "title": "Fix quickstart SDK snippets that reuse a closed client",
+    "labels": [
+      "bug",
+      "P2",
+      "area:getting-started"
+    ],
+    "body": "## Problem\nAt `docs/getting-started/quickstart.md:34`, the client is opened in a `with MLAIOpsClient(...) as client:` block. Later tabs (`:77`, `:98-101`, `:136-137`) call `client.submit_pipeline`, `client.list_models`, and `client.invoke_agent` outside that block. `MLAIOpsClient.__exit__` calls `self._client.close()` (`sdk-python/mlaiops_sdk/client.py:52-56`), so pasting the snippets in order fails with httpx \"client has been closed\". Other problems:\n- `:79` has `# poll until it completes` but no polling loop.\n- `:99` uses `models[0]`, which may not be the model the pipeline just registered.\n- `:34` hardcodes `http://localhost:8080` even though `local-up` can choose ports 18080-18084. The client already reads `MLAIOPS_URL` (`client.py:37`).\n\n## Proposal\nRewrite the SDK path as one continuous script: create the client once without `with` (or keep all steps inside it), poll the run with a timeout, and select the model by project ID. Rely on `MLAIOPS_URL` instead of a hardcoded URL.\n\n## Acceptance criteria\n- [ ] Pasting all SDK tabs in order into one Python session completes without errors against `make -C deploy local-up`.\n- [ ] The pipeline step includes a working poll loop with a timeout.\n- [ ] The model is selected by the project created earlier, not by list position.\n- [ ] No SDK snippet hardcodes the gateway port."
+  },
+  {
+    "title": "Remove the unpublished localhost:13337 IDE URL from four pages",
+    "labels": [
+      "bug",
+      "P2",
+      "area:reference"
+    ],
+    "body": "## Problem\nThe `ide` service in `deploy/compose.yaml:480-503` has no `ports:` entry. It uses `expose: [\"8080\"]` and `KIONGA_IDE_AUTH_MODE: none`, and it is reached through the gateway at `/workspace.html?tool=ide` (as `installation.md:97` says). These pages still give a host port and password:\n- `docs/connecting-services.md:18` and `:58` (`http://localhost:13337`, password `mlaiops-local`)\n- `docs/services/index.md:30` (port 13337)\n- `docs/services/ai-observability.md:131`\n- `docs/overview/architecture.md:15` (diagram node `:13337`)\n\n## Proposal\nReplace every 13337 reference with the gateway-proxied URL. Explain that Compose authenticates the IDE through the Kionga session, and that the generated password applies only to Kubernetes workspaces (`configuration.md`, `KIONGA_IDE_AUTH_MODE` row).\n\n## Acceptance criteria\n- [ ] `grep -rn 13337 docs/` returns no results, or only a clearly labeled Kubernetes port-forward example.\n- [ ] `connecting-services.md` lists the IDE credentials as \"Kionga session\".\n- [ ] The architecture diagram shows the IDE behind the gateway.\n- [ ] The IDE URL in the docs was opened after `make -C deploy ide-up`."
+  },
+  {
+    "title": "Correct the platform build output list and `verify` description",
+    "labels": [
+      "bug",
+      "P2",
+      "area:getting-started"
+    ],
+    "body": "## Problem\n`docs/getting-started/installation.md:138-143` says `make -C platform build` produces `mlaiops-trace-proxy` and `mlaiops-serving-manager`. `platform/Makefile:5` defines `GO_SERVICES := gateway operator integration-worker feature-gateway storage-proxy metrics-collector log-exporter cli`. Trace-proxy and serving-manager are built in their own repositories, and `mlaiops-log-exporter` is missing from the docs list.\n`installation.md:158` says `make -C platform verify` runs \"Go/Python tests + vet/ruff\". In `platform/Makefile:36-38`, `verify` is `lint test-go build`, plus `node --check` and a banned-word `rg` over `go` only. It runs no Python tests and no ruff. `docs/operations/troubleshooting.md:153` says the banned-tech scan covers `deploy/config/`, but the Makefile scans only `go`.\n\n## Proposal\nUpdate the binary list and the `verify` comment, and add the per-repo `make -C serving build` and `make -C trace-proxy build` targets. Correct the scan scope in `troubleshooting.md`.\n\n## Acceptance criteria\n- [ ] The binary list matches `GO_SERVICES` exactly.\n- [ ] Serving-manager and trace-proxy build instructions point to their own repositories.\n- [ ] The `verify` description lists only the checks the Makefile runs.\n- [ ] The `troubleshooting.md` scan scope matches `platform/Makefile`."
+  },
+  {
+    "title": "Use one environment variable for the gateway URL across all pages",
+    "labels": [
+      "dx",
+      "P2",
+      "area:getting-started"
+    ],
+    "body": "## Problem\nReaders are asked to export two different variables for the same value:\n- `installation.md:68`, `operations/local.md:26`, `:87`, and `troubleshooting.md:148` use `GATEWAY`.\n- `quickstart.md:11`, `guides/pipelines.md:8`, `guides/agents.md:11`, and `reference/api.md` use `MLAIOPS_URL` (18 pages in total).\n\nA reader who follows `installation.md` with a port override (`export GATEWAY=http://localhost:18080`) and then runs the quickstart gets `MLAIOPS_URL` defaulting to 8080, so every curl goes to the wrong port. The SDK and CLI read `MLAIOPS_URL` (`sdk-python/mlaiops_sdk/client.py:37`, `platform/go/cmd/cli/main.go:20`). Only `deploy/scripts/demo-smoke.sh` reads `GATEWAY`.\n\n## Proposal\nStandardize the docs on `MLAIOPS_URL`. Where `demo-smoke.sh` needs `GATEWAY`, show `GATEWAY=\"$MLAIOPS_URL\" ./deploy/scripts/demo-smoke.sh`. Optionally file a deploy issue for the script to accept `MLAIOPS_URL`.\n\n## Acceptance criteria\n- [ ] Every page that exports a gateway URL exports `MLAIOPS_URL`.\n- [ ] Smoke-test invocations derive `GATEWAY` from `MLAIOPS_URL`.\n- [ ] The installation port-override example carries through to the quickstart without a second export.\n- [ ] `grep -rn 'export GATEWAY' docs/` returns no results."
+  },
+  {
+    "title": "Document workspace identity tokens and KIONGA_ENVIRONMENT in configuration",
+    "labels": [
+      "security",
+      "P2",
+      "area:reference"
+    ],
+    "body": "## Problem\nSeveral settings the gateway reads are missing from `docs/getting-started/configuration.md`:\n- `KIONGA_ENVIRONMENT=production` enables proxy and edge checks (`platform/go/internal/httpapi/workspaces.go:99,329`; `runtimeconfig/config.go:80`).\n- `KIONGA_WORKSPACE_API_TOKEN` gates the internal workspace identity listener (`cmd/gateway/main.go:84`). Its Compose default is `kionga-local-workspace-api-identity-change-me` (`deploy/compose.yaml`, ide service).\n- `KIONGA_WORKSPACE_JOB_TOKEN` (default `kionga-local-workspace-jobs`) authorizes scaffold jobs.\n- `KIONGA_GATEWAY_INTERNAL_URL` (`http://gateway:8087`).\n- `KIONGA_LOG_EXPORTER_URL`, and `LOG_EXPORTER_PORT` (8086, `compose.yaml:228`). The published-ports table at `configuration.md:15-33` omits 8086.\n\nOperators cannot tell which change-me defaults to replace before exposing workspaces.\n\n## Proposal\nAdd a \"Workspace identity\" table and a \"Production mode\" note covering these variables, their defaults, and which ones must be rotated. Add `LOG_EXPORTER_PORT` to the ports table. Link the table from `operations/production-operations.md`.\n\n## Acceptance criteria\n- [ ] Each variable above appears in `configuration.md` with its default, owner, and purpose.\n- [ ] Tokens with change-me defaults are flagged as required to rotate for any shared deployment.\n- [ ] The ports table includes 8086 and notes it binds to 127.0.0.1.\n- [ ] A script or test lists the env vars referenced in Go code and flags any that are not documented."
+  },
+  {
+    "title": "Fix architecture diagram drift and standardize diagrams on Mermaid",
+    "labels": [
+      "docs",
+      "P2",
+      "area:overview"
+    ],
+    "body": "## Problem\nThe component diagram at `docs/overview/architecture.md:10-73` no longer matches `deploy/compose.yaml`:\n- It shows `metrics-collector :9090`, but there is no metrics-collector service in Compose.\n- It omits the `log-exporter`, `feature-materializer`, `elasticsearch`, `opensearch`, and `objectstore-init` services (`compose.yaml:108,208,231,237,358`).\n- It shows the IDE on `:13337` and Jupyter on a public `:8888`, but Jupyter binds to `127.0.0.1` (`compose.yaml:462`) and the IDE is not published.\n\nDiagram styles are also mixed. `architecture.md`, `repositories.md`, and `scaffolding.md` use Mermaid. `hosting.md:47-50`, `connecting-services.md:16-20`, and `reference/backend.md` use box-drawing ASCII, which does not reflow, does not support dark mode, and is read character by character by screen readers.\n\n## Proposal\nRegenerate the component diagram from the Compose service list, mark Compose profiles (ide, log-export) as optional, and convert the ASCII diagrams to Mermaid. Add a short caption and a source-of-truth comment to each diagram.\n\n## Acceptance criteria\n- [ ] Every node in the component diagram corresponds to a Compose service or a labeled external system.\n- [ ] No diagram shows a host port that Compose does not publish.\n- [ ] All diagrams in `docs/` use Mermaid fences.\n- [ ] A CI check fails when a Compose service is missing from the diagram."
+  },
+  {
+    "title": "Correct the Agent definition in core concepts to include non-LangGraph adapters",
+    "labels": [
+      "docs",
+      "P3",
+      "area:overview"
+    ],
+    "body": "## Problem\n`docs/overview/concepts.md:28` defines an Agent as \"A deployed LangGraph application\". `docs/guides/agents.md:3-9` and `docs/reference/implementation-status.md` (Agents row) say agents run through LangGraph, Agno, NOOA, or a custom adapter, and that non-LangGraph frameworks own their persistence and tracing. Readers who start with concepts will assume Agno and NOOA agents are unsupported. The same row says the agent references a \"graph module\", while `agents.md:16-17` calls it an `entrypoint` stored in the backwards-compatible `graph_module` field.\n\n## Proposal\nUpdate the Agent and Agent session rows to describe the framework-neutral entrypoint, and link to `guides/agent-frameworks.md`. Note which features (checkpoints, callbacks) are LangGraph-only.\n\n## Acceptance criteria\n- [ ] `concepts.md` names all supported frameworks or links to the framework guide.\n- [ ] The terms `entrypoint` and `graph_module` are used the same way in `concepts.md` and `agents.md`.\n- [ ] LangGraph-only capabilities are labeled as such."
+  },
+  {
+    "title": "Generate the REST API reference from a complete OpenAPI document",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:reference"
+    ],
+    "body": "## Problem\n`docs/reference/api.md` is a hand-written table. Comparing it with the routes registered in `platform/go/internal/httpapi/*.go` shows 52 routes missing from the page, including all of `/api/v1/admin/iam/*`, `/api/v1/iam/explain`, `/api/v1/iam/effective`, `/api/v1/logs`, `/api/v1/logs/stream`, `/api/v1/admin/feature-stores*`, `/api/v1/admin/storage-connections*`, `/api/v1/pipelines/validate`, `/api/v1/pipelines/preflight`, `/api/v1/projects/{id}/scaffold-jobs`, and `/api/v1/ready`. The served spec at `/api/openapi.json` (`platform/go/internal/httpapi/openapi.go`) has summaries only (no parameters, request bodies, schemas, or auth). It lists 70 paths and also omits 52 registered routes, so it cannot replace the page as it stands.\n\n## Proposal\n1. Make `openapi.go` (or a checked-in `openapi.yaml`) complete, with a Go test that fails when a registered route has no spec entry.\n2. Publish the spec into the docs build (for example, with `mkdocs-render-swagger-plugin` or `neoteroi-mkdocs` OAD), pinned to a platform release.\n3. Keep `api.md` as a short guide covering auth, errors, and pagination, and link to the generated pages.\n\n## Acceptance criteria\n- [ ] A platform test asserts that every `mux.HandleFunc` route has an OpenAPI operation.\n- [ ] Operations include parameters, request and response schemas, and the required role.\n- [ ] The docs site renders the reference from the spec and does not hand-maintain endpoint tables.\n- [ ] The docs build fails if the spec file cannot be fetched or parsed."
+  },
+  {
+    "title": "Generate the Python SDK reference from docstrings with mkdocstrings",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:reference"
+    ],
+    "body": "## Problem\n`docs/modules/python.md` describes the SDK by hand. Ten public `MLAIOpsClient` methods do not appear on it: `cancel_pipeline_run`, `retry_pipeline_run`, `list_pipeline_runs`, `get_pipeline_run`, `invoke_function`, `invoke_function_async`, `delete_function`, `search_huggingface_models`, `import_huggingface_model`, and `close`. `sdk-python/mlaiops_sdk/client.py` defines about 40 methods but has only one or two docstrings, so a generator has nothing to render yet. The package is `mlaiops-sdk` version 0.2.0 (`pyproject.toml:6-7`), but the docs do not state which SDK version they describe.\n\n## Proposal\n- Add Google-style docstrings to the public SDK surface (client, models, pipelines, agents, tools, tracing).\n- Add `mkdocstrings[python]` to `requirements-docs.txt` and render `::: mlaiops_sdk.client.MLAIOpsClient` pages from a pinned SDK tag.\n- Keep `python.md` as a task overview that links to the generated reference.\n\n## Acceptance criteria\n- [ ] Every public SDK method has a docstring covering its arguments, return type, and raised errors.\n- [ ] The docs site has a generated SDK reference page for each public module.\n- [ ] The reference shows the SDK version it was built from.\n- [ ] Strict build fails if a referenced symbol is missing."
+  },
+  {
+    "title": "Generate the CLI reference from the binary and fix build path and name",
+    "labels": [
+      "dx",
+      "P3",
+      "area:reference"
+    ],
+    "body": "## Problem\n`docs/reference/cli.md:14-16` shows `make -C platform build` (which produces `bin/mlaiops-cli`) and `cd go && go build -o mlaiops ./cmd/cli`. The README says paths are relative to the workspace folder, so the second command should be `cd platform/go`. Every example then calls `mlaiops`, but the Make target produces `mlaiops-cli`. The command list is maintained by hand. The source of truth is `usage()` in `platform/go/cmd/cli/main.go:98-106`, and the CLI has no `--help` or `version` subcommand to generate from.\n\n## Proposal\nAdd `mlaiops help` and `mlaiops version` to the CLI, generate `cli.md` from `help` output in the docs build or a pre-commit step, and fix the build instructions so the installed name matches the examples (rename the binary or add an install step).\n\n## Acceptance criteria\n- [ ] Build commands in `cli.md` work when run from the workspace folder.\n- [ ] The binary name in the build output matches the name used in examples.\n- [ ] The command list in `cli.md` is generated from CLI output, and a CI diff check catches drift.\n- [ ] The page shows the CLI version it documents."
+  },
+  {
+    "title": "Publish versioned documentation per release with mike",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\n`.github/workflows/pages.yml` deploys a single site from `main`. Components are tagged independently (`sdk-python` v0.2.0, `agent-runtime` v0.1.0; `platform` and `deploy` have no tags). `docs/reference/kionga-migration.md` describes a breaking identifier rename with \"No compatibility aliases\", but a reader on an older release has no way to view docs that match their installation. `mkdocs.yml` has no `extra.version` and no version selector.\n\n## Proposal\n- Define a platform release version that maps to component tags (a matrix page or a `versions.json` in `deploy`).\n- Adopt `mike` with Material's version provider: deploy `dev` from `main` and a numbered version on each release tag, with the `latest` alias.\n- Show an outdated-version banner on old versions.\n\n## Acceptance criteria\n- [ ] `mike` is pinned in `requirements-docs.txt` and the workflow publishes `dev` from `main`.\n- [ ] A tag push publishes a numbered version and moves `latest`.\n- [ ] The site header shows a version selector, and old versions show an outdated banner.\n- [ ] Each version page states the component versions it covers."
+  },
+  {
+    "title": "Add internal anchor, external link, and snippet checks to docs CI",
+    "labels": [
+      "testing",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\n`pages.yml` runs only `mkdocs build --strict`. `mkdocs.yml` has no `validation:` block, so with MkDocs 1.6 broken anchors are not treated as errors. `pymdownx.snippets` is enabled without `check_paths: true`, so a missing snippet file renders silently. External links are never checked: for example, `docs/guides/workbench.md:27` links to `warehouse.pypa.io/api-reference/xml-rpc/`, and `docs/guides/coding-workspace.md:50` deep-links into a code-server FAQ anchor. `connecting-services.md:61` and `:138` refer to `docs/hosting.md` as code text instead of a link, which no checker catches.\n\n## Proposal\n- Add `validation: {links: {anchors: warn, unrecognized_links: warn}}` to `mkdocs.yml`, which strict mode turns into errors.\n- Set `check_paths: true` for snippets.\n- Add a lychee (or htmlproofer) job on the built site: required for internal links, and a weekly scheduled job for external links that opens an issue.\n\n## Acceptance criteria\n- [ ] A deliberately broken anchor fails the PR build.\n- [ ] A missing snippet path fails the build.\n- [ ] A scheduled workflow reports dead external links.\n- [ ] Link checking is documented in `CONTRIBUTING.md`."
+  },
+  {
+    "title": "Add spelling and style linting (Vale, codespell) to docs CI",
+    "labels": [
+      "testing",
+      "P3",
+      "area:ci"
+    ],
+    "body": "## Problem\n`CONTRIBUTING.md` sets style rules (sentence-case headings, no marketing claims, consistent terminology), but nothing enforces them. Current drift:\n- Headings use `&` instead of \"and\": `# Models & serving` (`guides/models-serving.md:1`), `## Canary & rollback`, `## Data & backups` (`operations/local.md`), `# Technology & modules used`.\n- Terms vary: `realtime` (40 uses) and `real-time` (24) and `Real-Time` (5); `Postgres` (32) and `PostgreSQL` (44); `huggingface` and `Hugging Face` in prose.\n- Em dash density is high (27 in `modules/python.md`, 24 in `overview/what-is-kionga.md`), and `mkdocs.yml` `copyright` contains one.\n\n## Proposal\nAdd a `.vale.ini` with a Kionga vocabulary (accept and reject lists), a heading-case rule, and a terminology substitution rule. Add `codespell`. Run both on changed Markdown in PRs, as errors for spelling and warnings for style at first.\n\n## Acceptance criteria\n- [ ] Vale and codespell run in `pages.yml` on pull requests.\n- [ ] The vocabulary file defines the preferred form for real-time, PostgreSQL, Hugging Face, RustFS, and Kionga.\n- [ ] Existing violations are fixed or explicitly allow-listed.\n- [ ] `make docs-lint` runs the same checks locally."
+  },
+  {
+    "title": "Execute documented shell and Python snippets against a live stack in CI",
+    "labels": [
+      "testing",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\nThe docs contain copyable commands that are never run. Some have already broken without anyone noticing: the quickstart SDK snippets reuse a closed client (`getting-started/quickstart.md:34` vs `:77`), `reference/cli.md:16` uses a path that does not exist from the workspace root, and `operations/troubleshooting.md:84` writes to a `.env` that `make -C deploy local-up` does not read. `implementation-status.md` (Local verification commands) and `deploy/scripts/demo-smoke.sh` test the platform but not the docs text.\n\n## Proposal\n- Mark runnable fences with an attribute (for example, `` ```bash {data-test=\"quickstart\"} ``) and extract them with a small script or `pytest-markdown-docs`.\n- Add a workflow that checks out the sibling repositories, runs `make -C deploy local-up`, executes the tagged quickstart, installation, CLI, and SDK blocks in order, and uploads logs.\n- Run on a nightly schedule and on PRs that touch tagged pages.\n\n## Acceptance criteria\n- [ ] Quickstart curl and SDK blocks are tagged and run in CI against a Compose stack.\n- [ ] A failing snippet fails the job and names the page and line.\n- [ ] `CONTRIBUTING.md` explains how to tag a snippet and how to mark one as not runnable.\n- [ ] The nightly run publishes its status on the docs README."
+  },
+  {
+    "title": "Write a tutorial: train your own model and serve it as an endpoint",
+    "labels": [
+      "docs",
+      "P2",
+      "area:tutorials"
+    ],
+    "body": "## Problem\nThe only end-to-end model path is the seeded `training-pipeline` in `getting-started/quickstart.md:66-122`, which trains a fixed 12-feature `make_classification` model (`pipeline-runner/pipelines/training.py:28-30`). `guides/models-serving.md:10-11` says models are registered \"usually automatically by the training pipeline's register step, or manually\", but no page walks a user from their own data and code to a live endpoint. Readers have to piece it together from `models-serving.md`, `pipelines.md`, `workbench.md`, and `api.md`.\n\n## Proposal\nAdd `docs/tutorials/first-model-endpoint.md`: create a `production-ml` project, train a model in the workbench with MLflow logging, register it, review the quality gate, promote it, deploy it, call `/predict` with a matching payload, and roll back. Include expected output at each step and cleanup.\n\n## Acceptance criteria\n- [ ] The tutorial uses a dataset and model that are not the seeded demo.\n- [ ] Every step shows the console path and the SDK or curl equivalent, with expected output.\n- [ ] The tutorial ends with a successful prediction and a rollback.\n- [ ] Its commands are tagged for the CI snippet runner."
+  },
+  {
+    "title": "Write a tutorial: build and deploy a first agent with a custom tool",
+    "labels": [
+      "docs",
+      "P2",
+      "area:tutorials"
+    ],
+    "body": "## Problem\n`guides/agents.md` describes agent anatomy, the per-turn flow, and canary traffic. The `production-agent` starter is mentioned at `agents.md:193`. No page takes a reader from an empty project to a deployed agent that calls a tool they wrote. Tool registration (`POST /api/v1/tools`), the per-turn health gate that returns `503 agent_not_ready` (`agents.md` \"What happens per turn\"), and the image and entrypoint requirements of the Deploy agent modal are spread across `agents.md`, `agent-frameworks.md`, and `project-templates.md`.\n\n## Proposal\nAdd `docs/tutorials/first-agent-with-tools.md`: scaffold `production-agent`, write a typed tool, run the generated deterministic tests, build and push the image, register the tool, deploy through the console or SDK, chat, inspect the session, trace, and usage, then switch from `mock` to a real provider.\n\n## Acceptance criteria\n- [ ] The tutorial produces an agent whose reply proves the custom tool was called.\n- [ ] It covers local tests before deployment and the `pending` to `ready` transition.\n- [ ] It shows where to see token usage and cost for the session.\n- [ ] It links to troubleshooting for `agent_not_ready` and `[mock]` replies."
+  },
+  {
+    "title": "Write a tutorial: version a pipeline in Git and run it on a schedule",
+    "labels": [
+      "docs",
+      "P2",
+      "area:tutorials"
+    ],
+    "body": "## Problem\n`guides/pipelines.md` documents the YAML format (`:37-55`), revisions (`:63`), schedules (`:91-93`), and the CLI `apply` command, and `implementation-status.md` marks schedules as \"Implemented and verified\". No task-oriented page shows a first scheduled pipeline from start to finish: write `pipelines/<name>.kionga.yaml`, validate it, apply it, confirm the next fire time, watch a scheduled run, read node logs, and pause the schedule. Readers also need to know that schedules run as the owner, within the owner's quotas.\n\n## Proposal\nAdd `docs/tutorials/first-scheduled-pipeline.md` using two container nodes with digest-pinned public images, a `schedule` trigger set a few minutes ahead, `mlaiops pipeline validate` and `apply`, the run view, the logs API, and pause and resume.\n\n## Acceptance criteria\n- [ ] The tutorial YAML validates against `contracts` `pipeline/v1.schema.json`.\n- [ ] Following the steps produces at least one run whose trigger is the schedule.\n- [ ] It shows how to read node logs and how to roll back a revision.\n- [ ] It covers pausing the schedule as cleanup."
+  },
+  {
+    "title": "Restructure navigation: add Tutorials, move root pages, add redirects",
+    "labels": [
+      "ux",
+      "P3",
+      "area:ia"
+    ],
+    "body": "## Problem\nThe information architecture in `mkdocs.yml` has several mismatches:\n- `hosting.md` and `connecting-services.md` sit at the docs root but appear under Operations and Getting started.\n- `getting-started/configuration.md` is listed under Reference.\n- `services/*` and `modules/*` are nested three levels deep (Reference > Services > Gateway), which `navigation.tabs` plus `navigation.sections` render as long sidebars.\n- The Build tab mixes task guides with the engineering blog (`guides/engineering-blog.md`).\n- `reference/kionga-migration.md` is an upgrade procedure filed under Reference.\n- There is no Tutorials section.\n\n`CONTRIBUTING.md` requires \"a redirect plan before moving a published page\", but no redirect plugin is installed.\n\n## Proposal\nAdd `mkdocs-redirects`. Create a Tutorials tab. Move `hosting.md` to `operations/`, `connecting-services.md` and `configuration.md` to matching folders, and `kionga-migration.md` to `operations/upgrades/`. Flatten Reference to two levels.\n\n## Acceptance criteria\n- [ ] Each page's file path matches its nav section.\n- [ ] Every moved URL redirects to its new location.\n- [ ] No nav entry is deeper than two levels below a tab.\n- [ ] A Tutorials section exists and is linked from the landing page."
+  },
+  {
+    "title": "Add related-page links to guides that link nowhere",
+    "labels": [
+      "docs",
+      "P3",
+      "area:guides"
+    ],
+    "body": "## Problem\nThese pages contain no relative links to other docs pages: `connecting-services.md`, `guides/access-control.md`, `guides/agent-frameworks.md`, `guides/console-navigation.md`, `guides/feature-stores.md`, `guides/features.md`, `guides/huggingface.md`, `guides/realtime.md`, `guides/scaffolding.md`, and `operations/external-storage.md`. `CONTRIBUTING.md` says task guides should \"link to troubleshooting or next steps\". `connecting-services.md:61` and `:138` mention `docs/hosting.md` as inline code instead of a link, and `guides/realtime.md:62` tells readers to edit `.env` without linking to the configuration reference.\n\n## Proposal\nAdd a \"Next steps\" or \"Related\" section to each page above, linking to the relevant reference (API, configuration, RBAC), troubleshooting entry, and adjacent guide. Convert code-text file paths into links.\n\n## Acceptance criteria\n- [ ] Each listed page has at least two contextual internal links.\n- [ ] No page refers to another docs page by file path in backticks.\n- [ ] Settings mentioned in guides link to their row in `configuration.md`.\n- [ ] A CI script reports pages with zero outbound internal links."
+  },
+  {
+    "title": "Add a glossary that maps MLAIOps and Kionga identifiers",
+    "labels": [
+      "docs",
+      "P3",
+      "area:reference"
+    ],
+    "body": "## Problem\nReaders meet two vocabularies with no single explanation. The product is Kionga, and `reference/kionga-migration.md` says the rename uses \"the Kionga vocabulary consistently\". But the SDK is `mlaiops_sdk.MLAIOpsClient`, the CLI is `mlaiops`, the API group is `mlaiops.io/v1alpha1`, the env vars are `MLAIOPS_*`, the actor header is `X-MLAIOps-Actor` (`platform/go/cmd/cli/main.go`), the Compose project is `mlaiops` (`deploy/compose.yaml:10`), and the Kind cluster is `mlaiops`. Terms such as resource profile, ready-set scheduling, quality gate, canary weight, trusted Compose profile, and scale path are used across pages but defined only in passing (`overview/concepts.md` covers resources only).\n\n## Proposal\nAdd `reference/glossary.md` with definitions and a \"Kionga vs MLAIOps identifiers\" table. Enable the `abbr` extension with `pymdownx.snippets` `auto_append` so terms show hover definitions site-wide.\n\n## Acceptance criteria\n- [ ] The glossary defines at least 25 platform terms and links each to its main page.\n- [ ] A table lists every remaining `mlaiops` identifier and the surface it belongs to.\n- [ ] Abbreviation tooltips work on all pages.\n- [ ] `concepts.md` and the landing page link to the glossary."
+  },
+  {
+    "title": "Add troubleshooting for pipelines, schedules, IAM denials, and agents",
+    "labels": [
+      "docs",
+      "P2",
+      "area:operations"
+    ],
+    "body": "## Problem\n`docs/operations/troubleshooting.md` covers image pulls, disk space, ports, Docker, and a few service symptoms (headings at `:6-157`). It has no entries for the main user workflows:\n- pipeline runs stuck in `queued` or failing preflight (`/api/v1/pipelines/preflight`)\n- schedules that do not fire\n- `403` IAM denials, even though denials \"carry the deciding statement\" and `/api/v1/iam/explain` exists (`implementation-status.md`)\n- `503 agent_not_ready` from the `/healthz` gate (`guides/agents.md`, \"What happens per turn\")\n- workspace launch and scaffold job failures\n- Kubernetes Job execution and OOM reasons\n\nAll common symptoms are on one page with no index by component.\n\n## Proposal\nSplit troubleshooting by area (install, pipelines, models, agents, access, workspaces, Kubernetes). Each entry should give the symptom, the exact error text, a diagnostic command, and the fix.\n\n## Acceptance criteria\n- [ ] There are entries for pipeline preflight failure, a schedule not firing, IAM 403, `agent_not_ready`, and scaffold job failure.\n- [ ] Each entry quotes the real error code or message from the platform code.\n- [ ] Each entry includes at least one diagnostic command or API call.\n- [ ] Guides link to the matching troubleshooting entries."
+  },
+  {
+    "title": "Publish a changelog and release notes section for the docs site",
+    "labels": [
+      "docs",
+      "P3",
+      "area:reference"
+    ],
+    "body": "## Problem\nThe docs site has no changelog or release notes, and none of the component repositories has a `CHANGELOG` file. Breaking changes such as the identifier rename (`reference/kionga-migration.md`), the MinIO to RustFS switch (`reference/decisions/object-store.md`), and the cookie rename that invalidates sessions appear only in standalone pages. `implementation-status.md` changes delivery labels without recording when they changed. The docs repo history (55 commits) is the only record.\n\n## Proposal\nAdd a `release-notes/` section with one page per platform release: new capabilities, status label changes, breaking changes with links to upgrade steps, and component versions. Generate a draft from conventional-commit messages across repositories, then edit it by hand. Link the latest notes from the landing page.\n\n## Acceptance criteria\n- [ ] A Release notes nav entry exists, with an entry covering the Kionga rename and the RustFS switch.\n- [ ] Each entry lists component versions or commits.\n- [ ] Breaking changes link to their upgrade procedure.\n- [ ] `CONTRIBUTING.md` requires a release-notes line for any change to `implementation-status.md`."
+  },
+  {
+    "title": "Document the MinIO to RustFS data migration script",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:operations"
+    ],
+    "body": "## Problem\n`docs/reference/decisions/object-store.md:36-38` says \"The local stack has no automatic migration\" and that older Docker volumes are \"left untouched, not mounted into RustFS\". `deploy/scripts/migrate-minio-to-rustfs.sh` exists: it copies the `mlaiops_minio-data` buckets into RustFS, resumes on re-run, verifies objects, and writes `report.csv` and `summary.json`. No page mentions it. Users who upgrade see empty buckets and missing model artifacts. If they then follow `troubleshooting.md:127-128` or run `docker volume prune` to free space, they may delete the only copy of their MinIO data.\n\n## Proposal\nAdd an upgrade procedure under Operations covering: detecting a leftover `minio-data` volume, running the script, checking `summary.json`, verifying models load in MLflow, and when it is safe to remove the old volume. Link it from the ADR and from the volume-prune warning.\n\n## Acceptance criteria\n- [ ] An operations page documents the script's inputs (`MINIO_VOLUME`, `MINIO_IMAGE`, `OUT`) and outputs.\n- [ ] The ADR consequence text links to the procedure instead of saying no migration exists.\n- [ ] The procedure says not to remove `minio-data` until verification passes.\n- [ ] The procedure was run once against a volume created by a pre-RustFS release."
+  },
+  {
+    "title": "Reconcile the documented trace-proxy image with published registries",
+    "labels": [
+      "docs",
+      "P2",
+      "area:reference"
+    ],
+    "body": "## Problem\n`docs/getting-started/configuration.md` (Kubernetes scale path table) gives the `TRACE_PROXY_IMAGE` default as `ghcr.io/mlaiops/trace-proxy:latest`, which matches `platform/go/cmd/operator/main.go:53`. `docs/overview/repositories.md:17` says trace-proxy ships as `ghcr.io/kiongahq/trace-proxy`, and `repositories.md` says images run \"pinned by digest\". `WORKBENCH_IMAGE` and `IDE_IMAGE` default to the `kiongahq` org but also use `:latest`. An operator following the docs gets a sidecar from a different org on a mutable tag, which contradicts the digest pinning that `operations/public-vm.md:24` requires.\n\n## Proposal\nDocument the correct image for each Kubernetes default, state that Helm values must set digest-pinned images, and file a platform issue to change the operator default. Add a Helm values example that sets all three images by digest.\n\n## Acceptance criteria\n- [ ] Every documented image default names the `kiongahq` registry or is marked as a known defect with a linked issue.\n- [ ] The managed Kubernetes guide shows digest-pinned values for trace-proxy, workbench, and IDE images.\n- [ ] `repositories.md` and `configuration.md` agree on image names."
+  },
+  {
+    "title": "Name the exact .env file in troubleshooting and LLM setup steps",
+    "labels": [
+      "bug",
+      "P2",
+      "area:operations"
+    ],
+    "body": "## Problem\n`docs/operations/troubleshooting.md:84` runs `echo \"DOCKER_API_VERSION=1.44\" >> .env` from the workspace folder, which creates `~/kionga/.env`. `deploy/scripts/local-up.sh:12-14` changes into the deploy repository so Compose reads `deploy/.env`, so `make -C deploy local-up` ignores the value. The same unqualified `.env` appears in `guides/agents.md` (\"Using a real LLM\"), `guides/realtime.md:62`, `troubleshooting.md:97` and `:140`, `connecting-services.md:35` and `:130`, and `getting-started/configuration.md` (Anthropic example). Only `hosting.md:64` uses `deploy/.env`, and the repository ships `deploy/.env.example`, which no local guide mentions.\n\n## Proposal\nReplace every bare `.env` with `deploy/.env`. Add a short \"Local overrides\" section to `configuration.md` that starts from `cp deploy/.env.example deploy/.env` and explains which commands read it. Link to that section from each page.\n\n## Acceptance criteria\n- [ ] No page tells readers to edit a bare `.env`.\n- [ ] `configuration.md` documents `deploy/.env.example` and how the file is loaded.\n- [ ] The `DOCKER_API_VERSION` fix is shown applied through `make -C deploy local-up`.\n- [ ] The LLM setup steps state which services must be restarted."
+  },
+  {
+    "title": "Make diagrams, icons, and UI glyphs accessible on the docs site",
+    "labels": [
+      "accessibility",
+      "P3",
+      "area:site"
+    ],
+    "body": "## Problem\nThe Mermaid diagrams in `overview/architecture.md:10`, `overview/repositories.md`, and `guides/scaffolding.md` render as SVG with no text alternative or caption. The ASCII diagrams in `hosting.md:47-50` and `connecting-services.md:16-20` are read character by character by screen readers. UI labels use full-width glyphs (`＋ New project` at `quickstart.md:28`, `＋ Define flow` in `guides/pipelines.md`) that screen readers announce as \"fullwidth plus sign\". Landing page cards (`index.md:14-31`) use decorative icons without `aria-hidden`. No accessibility check runs in CI.\n\n## Proposal\nAdd a one-paragraph text description after each diagram (or `accTitle` and `accDescr` in Mermaid). Replace full-width glyphs with the button text alone. Mark decorative icons as hidden. Add an axe-core or pa11y job on the built site.\n\n## Acceptance criteria\n- [ ] Every diagram has `accTitle`/`accDescr` or an adjacent text description.\n- [ ] No full-width UI glyphs remain in the docs text.\n- [ ] A pa11y-ci or axe job runs on the built site with zero serious violations.\n- [ ] Light and dark palettes pass WCAG AA contrast for links and admonitions."
+  },
+  {
+    "title": "Tune site search so env vars, paths, and endpoints are findable",
+    "labels": [
+      "ux",
+      "P3",
+      "area:site"
+    ],
+    "body": "## Problem\n`mkdocs.yml` enables `search` with defaults, so the index splits words on whitespace and hyphens only. Identifiers that readers paste into search, such as `MLAIOPS_LLM_BACKEND`, `KIONGA_WORKSPACE_NAMESPACE`, `/api/v1/pipelines/preflight`, and `agents.customer_support.graph:build`, are indexed as single tokens. Searching for `LLM_BACKEND`, `preflight`, or `customer_support` does not match. Long reference tables (`getting-started/configuration.md`, `reference/api.md`) dominate results, and decision records compete equally with guides.\n\n## Proposal\nSet `plugins: - search: {separator: '[\\s\\-_,:!=\\[\\]()\"/.]+|(?!\\b)(?=[A-Z][a-z])'}`. Add `search.boost` front matter to the quickstart, configuration, and troubleshooting pages, and lower the boost for decision records. Add `tags` to pages for common tasks.\n\n## Acceptance criteria\n- [ ] Searching `LLM_BACKEND` returns the configuration and agents pages.\n- [ ] Searching `preflight` returns the pipelines guide and the API reference.\n- [ ] The quickstart ranks first for `install` and `quickstart`.\n- [ ] Search settings are documented in `CONTRIBUTING.md`."
+  },
+  {
+    "title": "Expand CONTRIBUTING into a docs contributor guide with page templates",
+    "labels": [
+      "dx",
+      "P3",
+      "area:contributing"
+    ],
+    "body": "## Problem\n`README.md` says \"Follow CONTRIBUTING.md for page structure, terminology, and verification\", but `CONTRIBUTING.md` has no terminology section. It says to \"check commands, flags, paths, and defaults against the owning repository\" without explaining how: there is no instruction to clone the sibling repositories, no list of which repository owns which page, and no guidance for grepping env vars or routes. There are no page templates for tutorials, guides, references, or runbooks. No CODEOWNERS file exists. `Makefile` has only `docs-install`, `docs-serve`, and `docs-build`, so there is no lint or check target to run before a PR.\n\n## Proposal\nAdd page templates under `templates/`, a page-to-repository ownership table, verification recipes (for example, how to diff the env vars in `configuration.md` against `os.Getenv` calls), a terminology section linked to the glossary, CODEOWNERS, a PR template with the review checklist, and a `make docs-check` target that runs the build, link check, and lint.\n\n## Acceptance criteria\n- [ ] Templates exist for tutorial, guide, reference, and runbook pages.\n- [ ] `CONTRIBUTING.md` maps each docs section to the repositories it must be verified against.\n- [ ] `.github/CODEOWNERS` and a pull request template exist.\n- [ ] `make docs-check` runs every CI docs check locally."
+  },
+  {
+    "title": "Rewrite the landing page around reader goals and a five-minute path",
+    "labels": [
+      "ux",
+      "P3",
+      "area:ia"
+    ],
+    "body": "## Problem\nThe opening of `docs/index.md` describes the platform in general terms (\"brings projects, pipelines, models, features, and AI agents into one control plane\") without saying who it is for or what a reader can accomplish in a first session. The first card says \"Clone the component repositories\", but the install path needs 25-35 GB of disk and 10-25 minutes (`installation.md:13-14`, `:80-82`), and the landing page does not mention this. \"What is included\" (`index.md:35-40`) lists ten components with no outcome attached. `index.md`, `getting-started/index.md`, and `overview/index.md` all repeat the same production and implementation-status warning. Tutorials, release notes, and versions are not reachable from the landing page.\n\n## Proposal\nRestructure the page into: a one-sentence audience and value statement, three goal-based entry points (evaluate locally, build a workflow, deploy for a team) with time and resource estimates, the current version and a link to release notes, and one consolidated status note.\n\n## Acceptance criteria\n- [ ] The landing page states the audience and the outcome of the first hour.\n- [ ] Install requirements (disk, RAM, time) are visible before the install link.\n- [ ] The production warning appears once, not repeated across three index pages.\n- [ ] Links to tutorials and release notes are present."
+  }
+]

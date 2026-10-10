@@ -1,0 +1,326 @@
+[
+  {
+    "title": "Remove the hardcoded default Jupyter token and fail closed when JUPYTER_TOKEN is unset",
+    "labels": [
+      "security",
+      "P1",
+      "area:jupyter"
+    ],
+    "body": "## Problem\n`jupyter/entrypoint.sh:73` starts JupyterLab with `--IdentityProvider.token=\"${JUPYTER_TOKEN:-mlaiops-local}\"`. If the deployment forgets to set `JUPYTER_TOKEN`, every workbench gets the same public token. The server binds `--ip=0.0.0.0` (`entrypoint.sh:65`) and sets `--ServerApp.trust_xheaders=True` (`entrypoint.sh:70`), so anyone who can reach port 8888 gets a terminal as `dev`, with the S3 mounts and `KIONGA_WORKSPACE_API_TOKEN` in the environment.\n\n## Proposal\n- Exit with a clear error when `JUPYTER_TOKEN` is empty, unless an explicit `KIONGA_ALLOW_INSECURE_LOCAL=true` is set. That flag also binds to 127.0.0.1.\n- Reject a token shorter than 32 characters or equal to the known `mlaiops-local` value.\n- Document that `trust_xheaders` assumes the platform gateway is the only ingress, and make it configurable.\n\n## Acceptance criteria\n- [ ] Starting the image without `JUPYTER_TOKEN` exits non-zero and prints the variable name.\n- [ ] `mlaiops-local` or any token shorter than 32 characters is rejected at startup.\n- [ ] The insecure local mode binds to 127.0.0.1 only.\n- [ ] A shell test (bats or pytest driving `sh jupyter/entrypoint.sh` with a stubbed `jupyter`) covers each of the three cases."
+  },
+  {
+    "title": "Stop falling back to JUPYTER_TOKEN or PASSWORD as the sidecar scaffold job token",
+    "labels": [
+      "security",
+      "P1",
+      "area:sidecar"
+    ],
+    "body": "## Problem\n`workspace/directories.py:161-165` (`expected_token`) accepts `KIONGA_WORKSPACE_JOB_TOKEN`, then falls back to `JUPYTER_TOKEN`, then `PASSWORD`. That makes the notebook login token (Jupyter) or the code-server login password (IDE, `ide/entrypoint.sh:24`) also the credential for `POST /scaffold-jobs`. The module docstring (`directories.py:13`) calls it a separate \"shared job token\". A leaked browser credential also grants job execution, and you cannot rotate the two separately.\n\n## Proposal\nRead only `KIONGA_WORKSPACE_JOB_TOKEN`. If it is missing, keep the existing 503 response (`directories.py:267-269`). Enforce a minimum length of 32 bytes. Log one startup warning when the variable is absent.\n\n## Acceptance criteria\n- [ ] With only `JUPYTER_TOKEN` or `PASSWORD` set, `POST /scaffold-jobs` returns 503.\n- [ ] A `KIONGA_WORKSPACE_JOB_TOKEN` shorter than 32 bytes is treated as unset.\n- [ ] New tests in `tests/test_workspace_directories.py` cover both fallback variables.\n- [ ] README lists `KIONGA_WORKSPACE_JOB_TOKEN` as required for scaffold jobs."
+  },
+  {
+    "title": "Scope S3FS mounts to the workspace's own project prefixes instead of platform buckets",
+    "labels": [
+      "security",
+      "P1",
+      "area:jupyter"
+    ],
+    "body": "## Problem\n`jupyter/entrypoint.sh:24` mounts six platform-wide buckets by default (`mlaiops-models mlaiops-artifacts mlaiops-features mlaiops-traces mlaiops-agents mlaiops-pipeline-logs`). All of them use the single `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` pair the container receives (`entrypoint.sh:28`). Each mount uses `-o allow_other` and `-o umask=0022` (`entrypoint.sh:39-42`), so every file is readable by every process in the container. Unless an external IAM policy restricts that key, every user can read every other user's traces, agent state and pipeline logs.\n\n## Proposal\n- Mount `bucket:/<project-or-user-prefix>` with s3fs's `bucket:/path` syntax, using a prefix supplied by the platform (for example `S3_MOUNT_PREFIX`).\n- Expect short-lived, per-workspace STS credentials limited to that prefix. Refuse to mount when the prefix is empty.\n- Change `umask` to `0077` and drop `allow_other` once the mount runs as `dev` (see the non-root FUSE issue).\n\n## Acceptance criteria\n- [ ] Mount commands include a non-empty prefix for every bucket. The entrypoint exits if `S3_MOUNT_PREFIX` is unset and mounts are required.\n- [ ] Mounted files are mode `0700`/`0600` for uid 1000.\n- [ ] Docs describe the IAM policy shape each workspace credential needs.\n- [ ] A shell test with a stubbed `s3fs` asserts the exact argv, including the prefix and umask."
+  },
+  {
+    "title": "Remove S3 credentials from the Jupyter process environment after mounting",
+    "labels": [
+      "security",
+      "P2",
+      "area:jupyter"
+    ],
+    "body": "## Problem\n`jupyter/entrypoint.sh:28` writes the S3 keys to `/run/s3fs-passwd` and leaves the file there. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` also stay exported when `exec \"$@\" jupyter lab` runs (`entrypoint.sh:64`). Every kernel, terminal, Jupyter AI call and coding-agent CLI started from the workbench inherits the raw keys, even though notebooks are meant to reach storage through the mounts or the platform API.\n\n## Proposal\nAfter all mounts succeed, delete `/run/s3fs-passwd` (s3fs reads it only at startup) and `unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY` before starting the sidecar and JupyterLab. If notebooks need direct S3 access, give them separate read-scoped credentials through an opt-in variable.\n\n## Acceptance criteria\n- [ ] `os.environ` in a fresh kernel contains no `AWS_SECRET_ACCESS_KEY` by default.\n- [ ] `/run/s3fs-passwd` is gone after startup, and the mounts still work.\n- [ ] A shell test with stubbed `s3fs` and `jupyter` asserts that the env passed to `jupyter` has no AWS keys."
+  },
+  {
+    "title": "Run coding agents launched by kionga scaffold with a scrubbed environment",
+    "labels": [
+      "security",
+      "P2",
+      "area:scaffolder"
+    ],
+    "body": "## Problem\n`workspace/kionga.py:1885` runs `subprocess.run(agent_command(...), cwd=target, check=True)` with no `env=` argument. The agent inherits the full workspace environment: `KIONGA_WORKSPACE_API_TOKEN`, the AWS keys, `MLAIOPS_TOKEN` and `JUPYTER_TOKEN`. Claude runs with `--permission-mode acceptEdits` (`kionga.py:1854`). The only guard is the prompt text \"Do not access credentials\" (`kionga.py:1840`), which a model is not bound to follow. The sidecar already has a scrubbing helper for its own child process (`directories.py:93-98`), but the CLI path does not use it.\n\n## Proposal\nBuild the agent environment from an allowlist: `PATH`, `HOME`, `LANG`, the agent's own API key variable (`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, see `kionga.py:1901`) and `KIONGA_WORKSPACE`. Share the helper with `directories.scrubbed_environment`.\n\n## Acceptance criteria\n- [ ] `agent_command` returns `(argv, env)`, or `scaffold` passes an explicit `env`.\n- [ ] Test: with `AWS_SECRET_ACCESS_KEY` and `KIONGA_WORKSPACE_API_TOKEN` set, a stub agent sees neither.\n- [ ] The agent still receives its own provider key when that key is set."
+  },
+  {
+    "title": "Reject dot segments and encoded traversal in the sidecar /api/v1 proxy",
+    "labels": [
+      "security",
+      "P2",
+      "area:sidecar"
+    ],
+    "body": "## Problem\n`workspace/directories.py:215` only rejects paths containing `#` or `//`. The path then goes to the gateway unchanged: `urllib.request.Request(upstream + self.path, ...)` (`directories.py:233`). Requests such as `/api/v1/../admin/...` or `/api/v1/%2e%2e/internal` pass the prefix check. If the gateway or any proxy in front of it normalizes the path, the request reaches non-`/api/v1` routes carrying the workspace's privileged `X-Kionga-Workspace-Token` header (`directories.py:229`).\n\n## Proposal\nParse with `urllib.parse.urlsplit`. Percent-decode the path once and reject any `.` or `..` segment, `%2f`, backslashes and control characters. Rebuild the upstream URL from the normalized path and the original query string.\n\n## Acceptance criteria\n- [ ] `/api/v1/../x`, `/api/v1/%2e%2e/x`, `/api/v1/a/%2F..` and `/api/v1/a\\\\b` return 404 and never reach the upstream.\n- [ ] Valid paths with query strings are forwarded unchanged.\n- [ ] Parametrized tests that use the fake gateway in `tests/test_workspace_directories.py:161`."
+  },
+  {
+    "title": "Validate repository URL, branch and namespace in kionga project sync",
+    "labels": [
+      "security",
+      "P2",
+      "area:scaffolder"
+    ],
+    "body": "## Problem\n`workspace/kionga.py:1933` takes `url` and `branch` from the control-plane response and passes them to `git clone --single-branch --branch <branch> <url> <target>` (`kionga.py:1952-1955`), `git checkout <branch>` and `git pull --ff-only origin <branch>` (`kionga.py:1945-1946`). Nothing is validated and there is no `--` separator. A branch such as `--orphan=x` is read as an option by `git checkout`. Any URL scheme is accepted, including `file://` and `ext::` (subject to the local `protocol.allow` setting). The `namespace` is only checked to stay under `WORKSPACE` (`kionga.py:1928-1930`). It does not go through the `NAMESPACE` regex that the sidecar uses (`directories.py:34`).\n\n## Proposal\n- Allow only `https://` URLs (and `ssh://` if needed) with no userinfo. Validate branches with `git check-ref-format --branch` and reject a leading `-`.\n- Add `--` before positional arguments in all three git calls, and run them with `-c protocol.allow=never -c protocol.https.allow=always`.\n- Validate `namespace` against the same regex as the sidecar.\n\n## Acceptance criteria\n- [ ] Branch `-x`, URL `ext::sh`, URL `file:///etc` and URL `https://user:pw@host/r.git` are each rejected before any subprocess call.\n- [ ] Every git argv contains `--` before user-controlled values.\n- [ ] Tests extend `test_project_sync_*` in `tests/test_workspace_cli.py:556-606`."
+  },
+  {
+    "title": "Catch git status timeouts in scaffold jobs so the client always gets a response",
+    "labels": [
+      "bug",
+      "P2",
+      "area:sidecar"
+    ],
+    "body": "## Problem\n`workspace/directories.py:125-128` calls `subprocess.run([... 'git', 'status' ...], timeout=15)`. `subprocess.TimeoutExpired` is not a subclass of `ValueError` or `OSError`, and `_scaffold` only catches those two (`directories.py:284-289`). On a slow volume or a large tree, the handler thread raises. The lock is released, but the client gets an empty reply instead of the JSON result, even though the scaffold itself succeeded.\n\n## Proposal\nCatch `subprocess.TimeoutExpired` in `git_status`, return `[]` plus a `git_status_error: \"timeout\"` field, and add a generic 500 JSON fallback in `_scaffold`.\n\n## Acceptance criteria\n- [ ] A slow `git` stub on `PATH` produces a 200 response with `git_status_error`.\n- [ ] Any unexpected exception in `_scaffold` returns JSON 500 and still releases `_job_lock`.\n- [ ] A test in `tests/test_workspace_directories.py` covers the timeout path through the HTTP fixture."
+  },
+  {
+    "title": "Run scaffold jobs in their own process group with CPU, memory and file limits",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:sidecar"
+    ],
+    "body": "## Problem\n`workspace/directories.py:140-143` runs the generator with `subprocess.run(..., timeout=timeout)`. On timeout, CPython kills only the direct child, so grandchildren such as `git init` (`kionga.py:1781`) can survive. The child has no `RLIMIT_AS`, `RLIMIT_FSIZE`, `RLIMIT_NPROC` or CPU limit, so one job can exhaust the workspace's memory or disk. `KIONGA_SCAFFOLD_TIMEOUT` is parsed with a bare `int()` at import time (`directories.py:42`), so a bad value crashes the sidecar at startup.\n\n## Proposal\nUse `Popen(start_new_session=True)` and `os.killpg` on timeout. Apply limits through `preexec_fn` / `resource.setrlimit` (memory 1 GiB, file size 100 MiB, 128 processes, all configurable). Clamp and validate the timeout value.\n\n## Acceptance criteria\n- [ ] A test CLI that forks a sleeping grandchild leaves no live process after the timeout.\n- [ ] A test CLI that writes past the file-size limit fails with a non-zero exit and a JSON result.\n- [ ] `KIONGA_SCAFFOLD_TIMEOUT=abc` logs a warning and falls back to 60 seconds."
+  },
+  {
+    "title": "Add socket timeouts and a concurrency cap to the workspace sidecar",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:sidecar"
+    ],
+    "body": "## Problem\nThe sidecar runs a plain `ThreadingHTTPServer` (`workspace/directories.py:296`). `Handler` sets no `timeout`, so a client that sends headers and then stalls keeps a thread open indefinitely. `_proxy_api` reads up to 10 MiB per request (`directories.py:226`) and buffers up to 20 MiB of upstream response in memory (`directories.py:241`), and the number of concurrent threads is unlimited. Any process in the container can open many connections to loopback port 8890 and starve the proxy the SDK depends on.\n\n## Proposal\nSet `Handler.timeout = 30`. Wrap the server in a bounded semaphore (for example 16 in-flight requests, returning 503 when full). Stream proxy responses in chunks instead of buffering 20 MiB.\n\n## Acceptance criteria\n- [ ] A stalled client connection closes after the timeout.\n- [ ] The 17th concurrent request gets a 503 while 16 are in flight.\n- [ ] Peak RSS stays under 64 MiB when proxying a 20 MiB response (measured in a test with the fake gateway)."
+  },
+  {
+    "title": "Require the workspace job token on POST /prepare-project",
+    "labels": [
+      "security",
+      "P3",
+      "area:sidecar"
+    ],
+    "body": "## Problem\n`/scaffold-jobs` checks `X-Kionga-Workspace-Token` (`workspace/directories.py:265-273`), but `/prepare-project` (`directories.py:255-263`) has no authentication. Any local process, or any browser session through `/proxy/8890`, can create arbitrary directories under `/workspace/projects`. The two endpoints that mutate the filesystem enforce different policies.\n\n## Proposal\nMove the token check into one `_authorize()` helper and call it from both `_prepare` and `_scaffold`. Keep the 503 \"disabled\" response when no token is configured.\n\n## Acceptance criteria\n- [ ] `POST /prepare-project` without a token returns 401 and creates no directory.\n- [ ] With a valid token it returns 200 as it does today.\n- [ ] Tests reuse the `sidecar` fixture in `tests/test_workspace_directories.py:136`."
+  },
+  {
+    "title": "Bound produced_files so large project trees do not stall scaffold responses",
+    "labels": [
+      "performance",
+      "P3",
+      "area:sidecar"
+    ],
+    "body": "## Problem\n`workspace/directories.py:111` runs `sorted(folder.rglob(\"*\"))`, which walks and sorts the whole tree before `FILE_LIMIT` (`directories.py:117`) applies. When a scaffold job targets an existing namespace that holds a `.venv`, `node_modules` or data files, every job walks the full tree. It skips `.git` only after visiting it (`directories.py:113`).\n\n## Proposal\nUse `os.walk` with pruning of `.git`, `.venv`, `node_modules` and `__pycache__`. Stop after `FILE_LIMIT` entries, sort only the collected list, and add `truncated: true` to the response when the cap is reached.\n\n## Acceptance criteria\n- [ ] With 100,000 files in a pruned directory, `produced_files` returns in under 200 ms.\n- [ ] The response includes `truncated` when more than `FILE_LIMIT` files exist.\n- [ ] A unit test covers pruning and truncation."
+  },
+  {
+    "title": "Supervise the workspace sidecar instead of backgrounding it from the entrypoint",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:images"
+    ],
+    "body": "## Problem\nBoth entrypoints start the sidecar with a bare `&` and then `exec` the main server: `jupyter/entrypoint.sh:62` and `ide/entrypoint.sh:20`. If the sidecar crashes (for example from a bad `KIONGA_SCAFFOLD_TIMEOUT`, `directories.py:42`, or a port conflict), nothing restarts it. Readiness still reports healthy because the gateway only probes the Jupyter path, so scaffold jobs and SDK API calls fail with proxy 502s. The Jupyter image also has no init process (`jupyter/Dockerfile:89`), so orphaned children are never reaped.\n\n## Proposal\nAdd `tini` to the Jupyter image (the IDE already uses `dumb-init`). Run the sidecar under a small restart loop or as a `jupyter-server-proxy` managed process with `launcher_entry` disabled. Add `GET /healthz` to the sidecar and include it in a container `HEALTHCHECK`.\n\n## Acceptance criteria\n- [ ] Killing the sidecar PID brings it back within 5 seconds.\n- [ ] `GET /healthz` on 127.0.0.1:8890 returns 200.\n- [ ] Both images declare a `HEALTHCHECK` that covers the main server and the sidecar.\n- [ ] A container smoke test in CI kills the sidecar and asserts recovery."
+  },
+  {
+    "title": "Make S3FS mounts retry per bucket, verify health and unmount on shutdown",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:jupyter"
+    ],
+    "body": "## Problem\n`jupyter/entrypoint.sh:31-44` mounts buckets in a loop under `set -e` (`entrypoint.sh:2`). If one bucket is missing or the endpoint is slow, the whole workbench exits, even when `S3_MOUNT_OPTIONAL=true`, because that flag is only checked when `S3_ENDPOINT` or `/dev/fuse` is missing (`entrypoint.sh:46-49`). s3fs gets no `retries`, `connect_timeout` or cache options. Nothing checks that a mount is still alive after startup, and stale FUSE mounts produce `Transport endpoint is not connected` in notebooks. Mounts are not unmounted on SIGTERM.\n\n## Proposal\n- Mount each bucket with `-o retries=5,connect_timeout=10,stat_cache_expire=60` and wait until `mountpoint -q` succeeds or a timeout expires.\n- Make `S3_MOUNT_OPTIONAL` apply per bucket: skip the failed bucket, log it and continue.\n- Trap TERM to run `fusermount3 -u` on each target.\n\n## Acceptance criteria\n- [ ] With one bad bucket and `S3_MOUNT_OPTIONAL=true`, the other buckets mount and Jupyter starts.\n- [ ] With `S3_MOUNT_OPTIONAL=false`, the error names the failing bucket.\n- [ ] A shell test with a stubbed `s3fs` that fails for one bucket covers both modes."
+  },
+  {
+    "title": "Run the Jupyter image as non-root and move FUSE mounting out of the user container",
+    "labels": [
+      "security",
+      "P2",
+      "area:jupyter"
+    ],
+    "body": "## Problem\n`jupyter/Dockerfile` has no `USER` directive (it ends at line 89), so the container starts as root. The entrypoint needs root to write `/run/s3fs-passwd` (`entrypoint.sh:27-29`), call `s3fs` with `allow_other` (enabled by `user_allow_other` in `/etc/fuse.conf`, `Dockerfile:22`), and `chown` state (`entrypoint.sh:15-17`). It then drops to `dev` with `runuser`. The pod therefore needs root plus `/dev/fuse` and usually `SYS_ADMIN`, and it cannot run under a `runAsNonRoot` policy. When it does start as non-root, the S3 branch fails at `entrypoint.sh:28` because `/run` is not writable.\n\n## Proposal\nOffer a non-root path. Either mount buckets through a CSI driver (for example the Mountpoint for S3 CSI driver) or use a privileged init or sidecar container with bidirectional mount propagation. Set `USER 1000` in the image. Keep the root path only behind an explicit build arg.\n\n## Acceptance criteria\n- [ ] The default image runs with `USER 1000` and starts with `S3_MOUNT_OPTIONAL=true` and no `/dev/fuse`.\n- [ ] When running as non-root, the entrypoint writes no files outside `/workspace` and `$HOME`.\n- [ ] The deploy docs show a Pod spec with `runAsNonRoot: true` and no added capabilities.\n- [ ] A CI smoke test runs the image with `--user 1000 --cap-drop ALL` and checks that `/workspaces/workbench/api/status` responds."
+  },
+  {
+    "title": "Reset the IDE image to the coder user instead of leaving USER root",
+    "labels": [
+      "security",
+      "P2",
+      "area:ide"
+    ],
+    "body": "## Problem\n`ide/Dockerfile:3` switches to `USER root` for package installation and never switches back. The image therefore runs as root, and `ide/entrypoint.sh:12-15` drops to `coder` with `runuser`. Unlike Jupyter, the IDE mounts no FUSE filesystems, so it has no need for root at runtime. Starting as root still prevents `runAsNonRoot` and runs the recursive `chown` at every start.\n\n## Proposal\nAdd `USER coder` after the final `RUN` in `ide/Dockerfile`. Keep the non-root branch of the entrypoint (`ide/entrypoint.sh:16-18`) as the only path, and require volumes to be owned by uid 1000 through `fsGroup`.\n\n## Acceptance criteria\n- [ ] `docker inspect` shows `User: coder` for the built image.\n- [ ] The container starts under `--user 1000 --cap-drop ALL`.\n- [ ] A CI smoke test checks that code-server responds under `/workspaces/ide` when run as non-root."
+  },
+  {
+    "title": "Stop running a recursive chown over persistent state at every startup",
+    "labels": [
+      "performance",
+      "P2",
+      "area:images"
+    ],
+    "body": "## Problem\n`jupyter/entrypoint.sh:17` runs `chown -R dev:dev ... \"$jupyter_state\"` and `ide/entrypoint.sh:14` runs `chown -R coder:coder ... \"$ide_state\"` at every boot. These directories hold `PYTHONUSERBASE`, the npm prefix, code-server extensions and lab settings on the persistent volume (`jupyter/entrypoint.sh:5-10`, `ide/entrypoint.sh:5-8`). As users install packages, startup time grows with file count, and on network volumes that can take minutes.\n\n## Proposal\nRun `chown` only when the top-level owner is wrong (`[ \"$(stat -c %u \"$dir\")\" != 1000 ]`), or rely on Kubernetes `fsGroup` with `fsGroupChangePolicy: OnRootMismatch` and drop the root branch.\n\n## Acceptance criteria\n- [ ] A second start with 50,000 files in `python-user` adds under 1 second over a cold start with an empty state directory.\n- [ ] A first start on a root-owned volume still fixes ownership.\n- [ ] A shell test asserts that `chown` is not called when ownership is already correct."
+  },
+  {
+    "title": "Pin base images by digest and install Python packages from a hashed lock file",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:images"
+    ],
+    "body": "## Problem\n`jupyter/Dockerfile:18` uses `python:3.11-slim` and `ide/Dockerfile:1` uses `codercom/code-server:4.99.4`, both by mutable tag. `jupyter/Dockerfile:25-33` installs open ranges (`jupyterlab>=4.2,<5`, `pandas>=2.2`, `pyarrow>=16`, `boto3>=1.34`, `prefect>=3.0`, `redis>=5`). Rebuilding the same commit can produce a different image. The header comment (`Dockerfile:9-11`) says versions are pinned to avoid training-serving skew, but only scikit-learn and mlflow are pinned.\n\n## Proposal\nAdd `jupyter/requirements.in` and a compiled `requirements.lock` (`uv pip compile --generate-hashes`), then install with `pip install --require-hashes -r`. Pin both base images as `name:tag@sha256:...` and let Renovate or Dependabot bump them.\n\n## Acceptance criteria\n- [ ] Both `FROM` lines include an `@sha256:` digest.\n- [ ] The Jupyter image installs only from a hashed lock file.\n- [ ] A CI job fails if `requirements.lock` is out of date with `requirements.in`.\n- [ ] Two clean builds of the same commit produce identical `pip freeze` output."
+  },
+  {
+    "title": "Verify checksums of downloaded platform source archives and the Node tarball",
+    "labels": [
+      "security",
+      "P2",
+      "area:images"
+    ],
+    "body": "## Problem\n`jupyter/platform_sources.py:30` downloads `https://github.com/kiongahq/<repo>/archive/refs/tags/<version>.tar.gz` and extracts it (`platform_sources.py:73`) without checking a digest. Tags are mutable, and GitHub-generated archives can change byte-for-byte. `jupyter/Dockerfile:42` and `ide/Dockerfile:19` pipe the Node.js tarball from `curl` straight into `tar` without checking `SHASUMS256.txt`. A moved tag or a compromised mirror ends up in the image without any warning.\n\n## Proposal\n- Add `SDK_SHA256`, `AGENT_RUNTIME_SHA256` and `PIPELINE_RUNNER_SHA256` build args. `platform_sources.py` refuses to extract on a mismatch, or when the digest is missing in release mode.\n- For Node, download to a file, check it against a pinned `NODE_SHA256_<arch>`, then extract.\n\n## Acceptance criteria\n- [ ] Release mode fails when a digest is missing or wrong, and the error names the repository.\n- [ ] New tests in `tests/test_platform_sources.py` use the existing `fetcher` injection (`platform_sources.py:52`) to cover the match, mismatch and missing cases.\n- [ ] Both Dockerfiles verify the Node tarball before extraction."
+  },
+  {
+    "title": "Reorder Jupyter image layers so SDK version bumps do not reinstall stable tools",
+    "labels": [
+      "performance",
+      "P3",
+      "area:images"
+    ],
+    "body": "## Problem\nIn `jupyter/Dockerfile`, the platform-source layer (`Dockerfile:51-67`) comes before `jupyter-ai==3.0.1` (`Dockerfile:68`) and `jupyter-server-proxy==4.4.0` (`Dockerfile:72`). Bumping `SDK_VERSION` invalidates the cache for both pinned installs. Node and the agent CLIs (`Dockerfile:39-45`) run a second `apt-get update`. `xz-utils` and the npm build leftovers stay in the final image. No multi-stage build separates downloads from runtime.\n\n## Proposal\nMerge all pinned third-party pip installs into one early layer. Build Node and the agent CLIs in a separate stage and `COPY --from` only `/usr/local/{bin,lib/node_modules}`. Put the platform-source layer and the `COPY workspace/...` lines last.\n\n## Acceptance criteria\n- [ ] Changing only `SDK_VERSION` rebuilds no layer above the platform-source step (verified with `docker build --progress=plain`).\n- [ ] The final image does not contain `xz-utils`.\n- [ ] The image size change is recorded in the PR description."
+  },
+  {
+    "title": "Pin reusable CI workflows to commit SHAs and attach an SBOM and scan to images",
+    "labels": [
+      "security",
+      "P2",
+      "area:images"
+    ],
+    "body": "## Problem\n`.github/workflows/ci.yml:11,16,21` call `kiongahq/.github/...@main`. A push to that repository's `main` changes how this repository builds and publishes images with `packages: write` (`ci.yml:17,22`). There is no SBOM, provenance attestation or vulnerability gate for `ghcr.io/kiongahq/jupyter` or `ide`, even though these images bundle s3fs, Node, two agent CLIs and the platform SDK.\n\n## Proposal\nReference the reusable workflows by full commit SHA, with Dependabot bumping them. In the image workflow, enable BuildKit `--sbom=true --provenance=mode=max` and add a Trivy or Grype step that fails on fixable CRITICAL findings.\n\n## Acceptance criteria\n- [ ] Every `uses:` in `ci.yml` references a 40-character SHA.\n- [ ] Published images carry SBOM and provenance attestations (`docker buildx imagetools inspect` shows them).\n- [ ] CI fails on a fixable CRITICAL CVE, with a documented allowlist file for exceptions."
+  },
+  {
+    "title": "Configure idle culling for Jupyter kernels and terminals",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:jupyter"
+    ],
+    "body": "## Problem\nThe Jupyter command line (`jupyter/entrypoint.sh:64-73`) sets no `MappingKernelManager.cull_idle_timeout`, `cull_interval`, `cull_connected` or `TerminalManager.cull_inactive_timeout`, and the image ships no `jupyter_server_config.py`. Idle kernels holding GPU memory or large DataFrames keep running indefinitely, and the platform has nothing to read to decide when a workspace is idle and can be scaled down. Resource profiles in `workspace/kionga.py:40-46` go up to 32Gi and one GPU.\n\n## Proposal\nShip `/etc/jupyter/jupyter_server_config.py` with culling defaults (kernel idle 1h, terminal 2h, interval 5m), all overridable by environment variables. Expose the last-activity timestamp from `/api/status` for platform-level idle shutdown.\n\n## Acceptance criteria\n- [ ] Culling defaults are set in a config file baked into the image.\n- [ ] `KIONGA_KERNEL_IDLE_SECONDS` overrides the kernel timeout.\n- [ ] A container test with a 10 s timeout shows an idle kernel culled within 30 s."
+  },
+  {
+    "title": "Isolate persisted user packages per image version so they cannot shadow image pins",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:jupyter"
+    ],
+    "body": "## Problem\n`jupyter/entrypoint.sh:5,10-11` puts `PYTHONUSERBASE` and the npm prefix on the persistent volume and prepends their `bin` directories to `PATH`. A `pip install --user scikit-learn` persists across image upgrades and silently replaces the `scikit-learn==1.7.0` pin that `Dockerfile:9-11` says prevents training-serving skew. The sidecar inherits this `PATH` (`entrypoint.sh:62`) and passes it to scaffold children (`directories.py:95`), so a `git` binary dropped in `python-user/bin` runs inside token-authenticated jobs. The IDE behaves the same way (`ide/entrypoint.sh:7-9`).\n\n## Proposal\n- Key the state directory by Python ABI and image version (for example `python-user/cp311-<image-tag>`) and print a notice when an older one exists.\n- Append user `bin` directories to `PATH` instead of prepending them.\n- Start the sidecar with a fixed system `PATH`.\n\n## Acceptance criteria\n- [ ] After an image upgrade, `import sklearn; sklearn.__version__` returns the image pin even if an older user install exists.\n- [ ] The sidecar's `PATH` contains no `/workspace` entries.\n- [ ] A shell test asserts the exported `PATH` order."
+  },
+  {
+    "title": "Use one project directory layout across the sidecar, scaffold CLI and project sync",
+    "labels": [
+      "bug",
+      "P2",
+      "area:scaffolder"
+    ],
+    "body": "## Problem\nThe sidecar creates projects at `/workspace/projects/<namespace>` (`workspace/directories.py:56-57`) and runs the CLI with `KIONGA_WORKSPACE=/workspace/projects` (`directories.py:95`). From a terminal, `KIONGA_WORKSPACE` is unset, so it defaults to `/workspace` (`kionga.py:26`). `kionga scaffold foo` then writes to `/workspace/foo` (`kionga.py:1865`), and `kionga project sync` clones to `/workspace/<namespace>` (`kionga.py:1928`). The same project ends up in two places depending on whether it was created from the console or the terminal, and `project sync` never finds a console-scaffolded folder.\n\n## Proposal\nAdd a `projects_root()` helper in `kionga.py` that returns `$KIONGA_WORKSPACE/projects` by default, and use it for `scaffold` and `project_sync`. Export the same variable in both entrypoints.\n\n## Acceptance criteria\n- [ ] `kionga scaffold demo` from a shell writes to `/workspace/projects/demo`.\n- [ ] `kionga project sync` on a console-scaffolded namespace operates on the existing folder.\n- [ ] One test runs both the sidecar path and the CLI path and asserts they produce the same directory."
+  },
+  {
+    "title": "Provide Git credentials through a gateway-backed credential helper",
+    "labels": [
+      "security",
+      "P2",
+      "area:sidecar"
+    ],
+    "body": "## Problem\n`kionga project sync` runs `git clone` and `git pull` (`workspace/kionga.py:1944-1955`) with no credential setup, and neither image configures `credential.helper`. Private repositories fail to clone, which pushes users to paste tokens into URLs. Those URLs persist in `.git/config` on the shared `/workspace` volume and show up in the error output that `directories.py:144` returns. No `user.name` or `user.email` is set either, so the first `git commit` in a fresh workspace fails.\n\n## Proposal\nAdd a `git-credential-kionga` helper that calls the sidecar, which in turn asks the gateway for a short-lived, repository-scoped token using the workspace identity (`directories.py:218-229`). Configure it in the system gitconfig of both images. Set `user.name` and `user.email` from gateway identity at startup.\n\n## Acceptance criteria\n- [ ] `git clone` of a private connected repository succeeds with no token in the URL or in `.git/config`.\n- [ ] The helper refuses hosts that are not the project's configured remote.\n- [ ] A test with a fake gateway checks the `get` and `erase` helper protocol."
+  },
+  {
+    "title": "Create generated repositories with a main branch, initial commit and pre-commit config",
+    "labels": [
+      "dx",
+      "P3",
+      "area:templates"
+    ],
+    "body": "## Problem\n`workspace/kionga.py:1780-1781` runs `git init -q` only. The default branch depends on the user's git config, there is no initial commit, and the sidecar reports every file as untracked (`directories.py:126`). Generated projects ship `ruff` and `pytest` as dev dependencies (`kionga.py:367`) but no `.pre-commit-config.yaml`, so lint runs only in CI (`kionga.py:431`).\n\n## Proposal\nRun `git init -b main`. Write a `.pre-commit-config.yaml` with ruff, ruff-format, end-of-file-fixer and detect-private-key, pinned by rev. Make an initial commit with a fixed author (`Kionga Scaffolder`) and a fixed date so output stays deterministic.\n\n## Acceptance criteria\n- [ ] `git -C <project> rev-parse --abbrev-ref HEAD` prints `main` and `git status --porcelain` is empty after scaffolding.\n- [ ] `pre-commit run --all-files` passes on every template.\n- [ ] The parametrized test `test_every_template_generates_the_delivery_contract` (`tests/test_workspace_cli.py:142`) asserts both."
+  },
+  {
+    "title": "Harden generated Dockerfiles and CI with pinned digests, locks and an image scan",
+    "labels": [
+      "security",
+      "P2",
+      "area:templates"
+    ],
+    "body": "## Problem\nThe generated Dockerfile (`workspace/kionga.py:394-407`) uses `python:3.11-slim` by tag in both stages and installs unlocked wheels built from open ranges (`kionga.py:283-331`, for example `torch>=2.4,<3`). It has no `HEALTHCHECK` for job workloads (`kionga.py:388`) and no `.dockerignore` entry for `.kionga`. The generated CI (`kionga.py:411-434`) pins actions by tag (`actions/checkout@v4`), runs on every push to every branch, and builds the image without scanning it. Users copy these defaults straight into production.\n\n## Proposal\n- Pin base images by digest. Generate `requirements.lock` with hashes and install with `--require-hashes`.\n- Pin actions by SHA, limit `push` to the default branch, and add a Trivy step plus `docker/build-push-action` with SBOM output.\n- Add `PIP_DISABLE_PIP_VERSION_CHECK=1` and keep `USER 65532`.\n\n## Acceptance criteria\n- [ ] Every generated `FROM` contains `@sha256:` and every `uses:` contains a 40-character SHA.\n- [ ] The generated CI has an image scan step that fails on CRITICAL findings.\n- [ ] Tests in `tests/test_workspace_cli.py` assert these properties for every template."
+  },
+  {
+    "title": "Back the blank-python template's typed claim with lint rules and a type check",
+    "labels": [
+      "testing",
+      "P3",
+      "area:templates"
+    ],
+    "body": "## Problem\nThe catalog describes `blank-python` as \"A typed, container-ready Python package with testing, linting, CI\" (`workspace/kionga.py:159`). The generated `pyproject.toml` sets only `line-length = 100` under `[tool.ruff]` (`kionga.py:375-376`), so ruff runs only its default rules. No `py.typed` marker, mypy or pyright configuration, or type-check step exists in the generated CI (`kionga.py:430-432`).\n\n## Proposal\nGenerate `[tool.ruff.lint] select = [\"E\", \"F\", \"I\", \"B\", \"UP\", \"S\"]`, add `src/<pkg>/py.typed`, add `mypy>=1.10` to the dev extra with `strict = true`, and add a `mypy src` CI step. Apply the same settings to every template.\n\n## Acceptance criteria\n- [ ] Every generated project passes `ruff check` with the expanded rule set and `mypy --strict src`.\n- [ ] `run_generated_tests` (`tests/test_workspace_cli.py:43`) also runs ruff and mypy.\n- [ ] The catalog description matches what is generated."
+  },
+  {
+    "title": "Generate a devcontainer.json that matches the workbench image",
+    "labels": [
+      "dx",
+      "P3",
+      "area:templates"
+    ],
+    "body": "## Problem\nScaffolded projects contain a Dockerfile and CI (`workspace/kionga.py:1720-1721`) but no `.devcontainer/devcontainer.json`. Developers who clone a project outside Kionga, in VS Code, Codespaces or a local devcontainer, get none of the workbench toolchain: the pinned scikit-learn/mlflow versions (`jupyter/Dockerfile:27-28`), the `kionga` CLI and ruff. The repository itself has no devcontainer either.\n\n## Proposal\nGenerate `.devcontainer/devcontainer.json` that references `ghcr.io/kiongahq/jupyter` (or the IDE image) by digest, runs `pip install -e .[dev]` as `postCreateCommand`, and forwards port 8080 for service templates. Add one at the repository root for contributors.\n\n## Acceptance criteria\n- [ ] Every template writes a `devcontainer.json` that parses as valid JSON with comments.\n- [ ] `devcontainer build` succeeds for `blank-python` in a CI job.\n- [ ] The template test asserts that the file exists and that the image reference contains a digest."
+  },
+  {
+    "title": "Publish a CUDA variant of the Jupyter workbench for GPU profiles",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:images"
+    ],
+    "body": "## Problem\nThe catalog offers a `gpu` profile with `gpu=1` (`workspace/kionga.py:44`) and `single-gpu`/`multi-gpu` accelerators for four templates (`kionga.py:79,100,120,141`). The only workbench image is built on `python:3.11-slim` (`jupyter/Dockerfile:18`), which has no CUDA runtime and no CUDA build of torch. Generated PyTorch code then raises `single-gpu selected but CUDA is not available` (`kionga.py:744`) when run in the workbench.\n\n## Proposal\nAdd a `jupyter-gpu` build target based on an `nvidia/cuda:*-cudnn-runtime` image pinned by digest. Install CUDA torch and xgboost from a GPU lock file and publish it as `ghcr.io/kiongahq/jupyter:<tag>-cuda`. Map the `gpu` profile to that image.\n\n## Acceptance criteria\n- [ ] CI builds and publishes the CUDA variant.\n- [ ] A GPU runner job (or a scheduled manual job) runs `python -c \"import torch; assert torch.cuda.is_available()\"` in the image.\n- [ ] Generated `distributed-training` tests pass inside the CUDA image on a GPU runner."
+  },
+  {
+    "title": "Emit structured audit logs and metrics for sidecar scaffold and proxy requests",
+    "labels": [
+      "observability",
+      "P3",
+      "area:sidecar"
+    ],
+    "body": "## Problem\nThe sidecar logs only the standard library access line (`workspace/directories.py:171-172`). Scaffold jobs record no job ID, namespace, duration, exit code or authentication failure (`directories.py:265-292`). Proxy calls record no upstream status or latency (`directories.py:213-253`). Operators cannot tell who ran which job or why a scaffold failed.\n\n## Proposal\nWrite one JSON line per request to stderr with `event`, `job_id`, `namespace`, `status`, `exit_code`, `duration_ms` and `upstream_status`. Never include tokens; pass all output through `redact` (`directories.py:101`). Expose counters at `GET /metrics` in Prometheus text format.\n\n## Acceptance criteria\n- [ ] Each scaffold request logs exactly one JSON line with the fields above.\n- [ ] A 401 attempt logs `event=auth_failed` without the provided token.\n- [ ] Tests capture stderr from the HTTP fixture and assert the schema."
+  },
+  {
+    "title": "Add container smoke tests and shellcheck for both entrypoints",
+    "labels": [
+      "testing",
+      "P2",
+      "area:images"
+    ],
+    "body": "## Problem\n`jupyter/entrypoint.sh` and `ide/entrypoint.sh` contain the token defaults, mount logic, privilege drop and sidecar launch, but nothing in `tests/` executes them. The test files cover only `platform_sources.py`, `kionga.py` and `directories.py`. CI builds the images (`.github/workflows/ci.yml:14-23`) but never starts them, so a broken `runuser`, a missing binary or a wrong `base_url` (`entrypoint.sh:69`) ships unnoticed.\n\n## Proposal\nAdd `shellcheck` to CI. Add a smoke job that starts each image with `S3_MOUNT_OPTIONAL=true` and checks that `GET /workspaces/workbench/api/status` (Jupyter) and `/workspaces/ide/healthz` (IDE) succeed, and that the sidecar answers through `/proxy/8890` with a 401 for an unauthenticated scaffold request.\n\n## Acceptance criteria\n- [ ] `shellcheck jupyter/entrypoint.sh ide/entrypoint.sh` runs in CI with zero warnings.\n- [ ] The smoke job starts both images and asserts the three HTTP checks.\n- [ ] The image publish jobs depend on the smoke job passing."
+  },
+  {
+    "title": "Make the quickstart notebook use the sidecar identity and drop hardcoded secrets",
+    "labels": [
+      "ux",
+      "P2",
+      "area:jupyter"
+    ],
+    "body": "## Problem\n`jupyter/quickstart.ipynb:9` says \"The platform API uses your provisioned workspace identity automatically\", but the cells call `os.environ[\"MLAIOPS_URL\"]` directly with `httpx` and no auth (`quickstart.ipynb:40`), bypassing the sidecar proxy that adds the identity (`directories.py:229`). Line 117 registers the model into `projects[0]`, an arbitrary project. Lines 172-175 hardcode `localhost` URLs and publish the Langfuse login `admin@local.dev` / `mlaiops-local-admin`. `pyproject.toml:6` excludes notebooks from ruff, and no test runs the notebook. The entrypoint seeds it once (`entrypoint.sh:56-58`), so fixes never reach existing users.\n\n## Proposal\nRoute calls through the SDK or the sidecar URL. Let the user pick a project by name. Build links from environment variables. Remove credentials. Add a CI check that parses the notebook and runs it with `nbclient` against the fake gateway. Seed a versioned copy (`quickstart-v2.ipynb`) when the image version changes.\n\n## Acceptance criteria\n- [ ] The notebook contains no `localhost` URLs and no passwords (a grep-based test asserts this).\n- [ ] API cells succeed through the sidecar in the smoke environment.\n- [ ] Existing workspaces receive the new version under a new filename, and the user's copy is left untouched."
+  },
+  {
+    "title": "Pin JupyterLab and code-server extensions through a tested manifest",
+    "labels": [
+      "reliability",
+      "P3",
+      "area:ide"
+    ],
+    "body": "## Problem\nJupyterLab is installed as `jupyterlab>=4.2,<5` (`jupyter/Dockerfile:26`) next to the exact pins `jupyter-ai==3.0.1` and `jupyter-server-proxy==4.4.0` (`Dockerfile:68,72`). A new 4.x minor release can break those extensions, and nothing tests that combination. The IDE pre-installs no extensions. Users install them into the persistent `--extensions-dir` (`ide/entrypoint.sh:26`), from whatever version the marketplace serves, so two developers on the same project end up with different Python and Jupyter tooling.\n\n## Proposal\nAdd `jupyter/extensions.txt` (exact versions) and `ide/extensions.txt` (`publisher.name@version`, for example `ms-python.python` and `charliermarsh.ruff`). Install both at build time into image-owned directories. Add a check that `jupyter labextension list` shows every pinned extension as enabled and OK.\n\n## Acceptance criteria\n- [ ] JupyterLab is pinned to an exact version.\n- [ ] The IDE image contains the pinned extensions at the listed versions.\n- [ ] A CI step fails if any pinned Jupyter extension reports a compatibility error."
+  },
+  {
+    "title": "Refuse KIONGA_IDE_AUTH_MODE=none when code-server binds to all interfaces",
+    "labels": [
+      "security",
+      "P2",
+      "area:ide"
+    ],
+    "body": "## Problem\n`ide/entrypoint.sh:23-24` binds code-server to `0.0.0.0:8080` and takes `--auth \"${KIONGA_IDE_AUTH_MODE:-password}\"` straight from the environment. Setting the mode to `none` exposes an unauthenticated shell, and `/proxy/8890` with it, to anything that can reach the pod. With `password` mode and no `PASSWORD` set, code-server generates one into the persistent config directory, and the sidecar's token fallback does not see it (`directories.py:162`).\n\n## Proposal\nAllow only `password` or `none`. If `none`, bind to `127.0.0.1` unless `KIONGA_IDE_TRUSTED_PROXY=true` is set, and log which mode is active. Require `PASSWORD` to be set and at least 32 characters in `password` mode.\n\n## Acceptance criteria\n- [ ] An unknown auth mode exits non-zero.\n- [ ] `none` without the trusted-proxy flag binds to loopback only.\n- [ ] Shell tests with a stubbed `code-server` assert the argv for each case."
+  },
+  {
+    "title": "Document workspace environment variables, security model and storage layout",
+    "labels": [
+      "docs",
+      "P3",
+      "area:images"
+    ],
+    "body": "## Problem\n`README.md` covers build and test commands but none of the runtime contract. The entrypoints and sidecar read `JUPYTER_TOKEN`, `S3_ENDPOINT`, `S3_MOUNT_ROOT`, `S3_MOUNT_BUCKETS`, `S3_MOUNT_OPTIONAL` (`jupyter/entrypoint.sh:23-48`), `KIONGA_IDE_AUTH_MODE` (`ide/entrypoint.sh:24`), `KIONGA_WORKSPACE_JOB_TOKEN`, `KIONGA_SCAFFOLD_TIMEOUT`, `KIONGA_SIDECAR_PORT`, `KIONGA_GATEWAY_INTERNAL_URL`, `KIONGA_WORKSPACE_API_TOKEN` and `KIONGA_WORKSPACE_NAME` (`workspace/directories.py:42,162,218-220,296`), plus `KIONGA_CUSTOM_AGENT_COMMAND` (`kionga.py:1856`). The `/workspace/.kionga/{jupyter,ide}` state layout (`jupyter/entrypoint.sh:4`, `ide/entrypoint.sh:4`) and the trust boundary between the browser, the sidecar and the gateway are not described anywhere.\n\n## Proposal\nAdd `docs/runtime.md` with a table of every variable (required or optional, default, which image reads it), a diagram of `/workspace`, and a threat model section covering the token types and what each one grants.\n\n## Acceptance criteria\n- [ ] Every `os.environ`/`getenv` and `${VAR}` reference in the repository appears in the table.\n- [ ] A test greps the sources for variable names and fails when one is missing from `docs/runtime.md`.\n- [ ] README links to the new page."
+  }
+]

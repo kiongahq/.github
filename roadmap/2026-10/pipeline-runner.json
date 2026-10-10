@@ -1,0 +1,281 @@
+[
+  {
+    "title": "Stop forwarding MLAIOPS_TOKEN and AWS credentials into every node container",
+    "labels": [
+      "security",
+      "P1",
+      "area:security"
+    ],
+    "body": "## Problem\n`PASSTHROUGH_ENVIRONMENT` (`pipelines/definition.py:38-47`) lists `MLAIOPS_TOKEN`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`. `_container_environment` (`pipelines/definition.py:199`) copies all of them into every user-defined node container. Any image named in a pipeline definition therefore receives the platform internal service token (the same token the runner uses for `report_step` in `pipelines/report.py:27-28`) and the runner's object-store credentials. A third-party or compromised image can call the gateway as `pipeline-engine` for any run, and can read or write any bucket those keys reach.\n\n## Proposal\n- Remove `MLAIOPS_TOKEN` and the AWS keys from the default passthrough.\n- Have the gateway mint a run-scoped, short-lived token (for example `KIONGA_RUN_TOKEN`) limited to that run's log and artifact endpoints, and inject only that.\n- Pass object-store credentials only to jobs that declare them, through scoped credentials (STS session or presigned URLs) rather than the runner's own keys.\n- Keep an explicit `MLAIOPS_PIPELINE_PASSTHROUGH_ENV` allowlist for operators who need extra variables.\n\n## Acceptance criteria\n- [ ] A node container started with `MLAIOPS_TOKEN` and `AWS_SECRET_ACCESS_KEY` set on the runner does not see either variable.\n- [ ] Variables listed in `MLAIOPS_PIPELINE_PASSTHROUGH_ENV` are forwarded and no others.\n- [ ] Unit test on `_container_kwargs` asserts the environment contains no runner credential by default.\n- [ ] README documents the new variable and the credential model."
+  },
+  {
+    "title": "Redact secret values from step messages and streamed node logs",
+    "labels": [
+      "security",
+      "P1",
+      "area:logs"
+    ],
+    "body": "## Problem\nNode output goes to the gateway without any filtering:\n- Streamed lines are shipped verbatim (`pipelines/definition.py:289`).\n- On failure the whole log tail is embedded in the error (`pipelines/definition.py:318`, `pipelines/definition.py:328-331`) and posted as the step message (`pipelines/definition.py:392`).\n- On success the tail is the step message (`pipelines/definition.py:397`).\n- The flow also raises an exception that concatenates every failure message (`pipelines/definition.py:540`), and Prefect stores it as the flow run state message.\n\nA container that prints its environment (a common debugging step) leaks `MLAIOPS_TOKEN`, the AWS keys and any job `environment` secret into the log store and into Prefect.\n\n## Proposal\nAdd a `Redactor` built per attempt from the values of the passthrough variables, any job environment keys that match secret patterns (`*_TOKEN`, `*_SECRET*`, `*_KEY`, `PASSWORD`), and values that are explicitly marked secret. Apply it in `LogShipper.add`, in `_bounded_logs`, and to every `report_step` message. Values shorter than 6 characters are skipped so they do not cause false positives.\n\n## Acceptance criteria\n- [ ] A fake container that prints `MLAIOPS_TOKEN=abc123secret` produces shipped log entries and a step message containing `***` and never the raw value.\n- [ ] The flow failure exception message is redacted.\n- [ ] Redaction handles a secret split across two docker log chunks (test included).\n- [ ] Unit tests cover the pattern list and the minimum-length rule."
+  },
+  {
+    "title": "Resolve job secrets at start time instead of storing them in flow parameters",
+    "labels": [
+      "security",
+      "P2",
+      "area:security"
+    ],
+    "body": "## Problem\nThe only way to give a node a secret is a literal value in `job.environment`, which `_container_environment` copies as-is (`pipelines/definition.py:200`). The whole `definition` dict is a Prefect flow parameter (`pipelines/definition.py:513-518`), so Prefect persists every secret value in plaintext in its database, shows it in the UI and returns it from the flow run API.\n\n## Proposal\nSupport `secrets: [{name: DB_PASSWORD, ref: <secret id>}]` on a job. The runner fetches values from the gateway (or a Prefect `Secret` block) inside `run_container_job` just before `containers.create`, injects them into the container environment, and registers them with the redactor. Reject definitions that put values matching secret key patterns directly in `environment`, or emit a warning step message.\n\n## Acceptance criteria\n- [ ] A job with a `secrets` ref gets the resolved value in its container environment.\n- [ ] Flow run parameters stored in Prefect contain only the ref, never the value (test asserts the `definition` dict is unchanged).\n- [ ] A failed secret lookup reports the step as `failed` with a clear message and does not start the container.\n- [ ] Documented in README with an example."
+  },
+  {
+    "title": "Enforce a registry allowlist and require digest-pinned images",
+    "labels": [
+      "security",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\n`definition_layers` only checks that `image` is a non-empty string (`pipelines/definition.py:88`). `_create_container` pulls whatever reference it gets on `ImageNotFound` (`pipelines/definition.py:263`), so mutable tags such as `:latest` from any registry are run with the runner's network access and the credentials described in the passthrough issue. The image digest is only recorded after start, best-effort (`pipelines/definition.py:307`, `pipelines/definition.py:267-274`), so nothing guarantees that the image that ran is the image that was reviewed.\n\n## Proposal\n- Add `MLAIOPS_PIPELINE_ALLOWED_REGISTRIES` (comma-separated prefixes). Reject any other image before pulling.\n- Add `MLAIOPS_PIPELINE_REQUIRE_DIGEST=true`, which rejects references without `@sha256:`.\n- After pull, compare the local image's `RepoDigests` entry for the requested repository with the pinned digest and fail on mismatch.\n- Optional hook for signature verification (cosign) in a follow-up.\n\n## Acceptance criteria\n- [ ] An image outside the allowlist fails the step with status `failed` and no pull call (fake client asserts `images.pulled == []`).\n- [ ] With digest enforcement on, `repo:tag` is rejected and `repo@sha256:...` runs.\n- [ ] A digest mismatch after pull fails the step and removes the container.\n- [ ] Both settings are documented with their defaults."
+  },
+  {
+    "title": "Report the digest of the requested repository instead of RepoDigests[0]",
+    "labels": [
+      "bug",
+      "P3",
+      "area:reporting"
+    ],
+    "body": "## Problem\n`_image_digest` returns `RepoDigests[0]` (`pipelines/definition.py:271-273`). When an image is tagged in several repositories (a mirror plus the origin, or `ghcr.io` plus a local registry), the first entry can belong to a different repository than the one in `job[\"image\"]`. When `RepoDigests` is empty (a locally built image), it falls back to the local image id (`pipelines/definition.py:274`), which is not a registry digest, but it is reported under the same `image_digest` fact. The README says the runner reports \"the image digest that actually ran\" (`README.md:15-16`).\n\n## Proposal\nPick the `RepoDigests` entry whose repository matches the requested image's repository. If none matches, report `image_id` as a separate fact and leave `image_digest` unset.\n\n## Acceptance criteria\n- [ ] Unit test: image with `RepoDigests=[\"mirror/x@sha256:a\", \"ghcr.io/org/x@sha256:a\"]` and job image `ghcr.io/org/x:1` reports the `ghcr.io` entry.\n- [ ] Unit test: no `RepoDigests` reports `image_id` and no `image_digest`.\n- [ ] Step report payload documents both facts in the `report_step` docstring (`pipelines/report.py:21-22`)."
+  },
+  {
+    "title": "Run node containers as non-root with a read-only rootfs and an isolated network",
+    "labels": [
+      "security",
+      "P2",
+      "area:security"
+    ],
+    "body": "## Problem\n`_container_kwargs` (`pipelines/definition.py:223-250`) drops capabilities and sets `no-new-privileges`, but:\n- It sets no `user`, so most images run as root inside the container.\n- The root filesystem is writable (acknowledged in `pipelines/definition.py:12-13`), with no `tmpfs` for scratch space.\n- Without `MLAIOPS_PIPELINE_NETWORK` the node joins the default bridge (`pipelines/definition.py:242-243`). With it set to the Compose network, the node can reach the gateway, Prefect API, MLflow and any other service on that network. Egress is not restricted.\n- No `ulimits`, `ipc_mode` or `storage_opt` size limits are set.\n\n## Proposal\n- Default `user` to `65534:65534`, overridable per job (`security.run_as_user`) within an operator-set allowlist.\n- Add `read_only=True` with `tmpfs={\"/tmp\": \"size=...\"}` plus an explicit writable work volume, behind `MLAIOPS_PIPELINE_READ_ONLY_ROOTFS` (default on).\n- Default to a dedicated internal network created by the runner with no route to Compose services. Jobs opt in to `network: platform` explicitly.\n- Set `ulimits` for `nofile` and `ipc_mode=\"private\"`.\n\n## Acceptance criteria\n- [ ] `_container_kwargs` unit test asserts `user`, `read_only`, `tmpfs` and `ipc_mode` defaults.\n- [ ] Docker integration test: `id -u` prints `65534` and writing to `/` fails while `/tmp` works.\n- [ ] Docker integration test: a default node cannot resolve or connect to the gateway service.\n- [ ] README security section lists each default and how to override it."
+  },
+  {
+    "title": "Bound the partial-line buffer in _follow_logs to prevent runner memory exhaustion",
+    "labels": [
+      "bug",
+      "P1",
+      "area:logs"
+    ],
+    "body": "## Problem\n`_follow_logs` concatenates every chunk onto `partial` until a newline arrives (`pipelines/definition.py:282-283`). A node that writes a large binary blob or a progress bar with `\\r` and no `\\n` grows `partial` without limit inside the runner process, which serves every flow (`pipelines/serve.py:17-20`). One misbehaving container can OOM the runner and take down all in-flight runs. Also, the `sent >= limit` check happens before a line is counted (`pipelines/definition.py:285-289`), so a single 90 MiB line is shipped whole even with a 5 MiB stream cap.\n\n## Proposal\n- Cap `partial` at a max line length (for example 16 KiB). When exceeded, ship the prefix with a `[line truncated]` marker and discard the rest until the next newline.\n- Account bytes before shipping and truncate the line that crosses the stream limit.\n- Treat a lone `\\r` as a line break for progress output.\n\n## Acceptance criteria\n- [ ] Test: a fake container that emits 50 MiB without newlines keeps `partial` under the cap and ships at most `limit` bytes plus the notice.\n- [ ] Test: a single line larger than the stream limit is truncated, not shipped whole.\n- [ ] Test: `\\r`-separated progress output yields separate entries.\n- [ ] Existing `test_log_streaming_is_capped` still passes."
+  },
+  {
+    "title": "Add a bounded queue, retries and backpressure to LogShipper",
+    "labels": [
+      "performance",
+      "P2",
+      "area:logs"
+    ],
+    "body": "## Problem\n`LogShipper` (`pipelines/report.py:54-98`) has three problems:\n- `_pending` is an unbounded list (`pipelines/report.py:68`).\n- When a batch fills, `add` calls `flush` synchronously on the caller's thread (`pipelines/report.py:81-83`). The caller is the `_follow_logs` reader, so a slow gateway (10 s timeout in `pipelines/report.py:110`) stalls reading of the Docker log stream. This contradicts the class docstring (`pipelines/report.py:57-59`).\n- A failed POST drops the batch silently after a `print` (`pipelines/report.py:111-112`), with no retry.\n\nAt shutdown, `close` joins the loop thread with a 5 s timeout and then flushes again (`pipelines/report.py:95-98`), so two flushes can race on the same entries.\n\n## Proposal\n- Replace the list with a `queue.Queue(maxsize=N)`. `add` never performs I/O.\n- Have a single sender thread with bounded exponential retry for 5xx and connect errors, reusing one `httpx.Client`.\n- When the queue is full, drop the oldest entries and count them. Emit one `[N log lines dropped]` entry when space returns.\n- Make `close` drain with a deadline and report how many entries were dropped.\n\n## Acceptance criteria\n- [ ] Test: with a `post` that sleeps 2 s, `add` returns in under 10 ms for 10k lines.\n- [ ] Test: a transient 503 followed by 200 delivers the batch once.\n- [ ] Test: overflow produces a single drop-notice entry with the correct count.\n- [ ] No concurrent flush of the same entries (test with a counting post)."
+  },
+  {
+    "title": "Keep the output tail from the log follower instead of re-reading all logs",
+    "labels": [
+      "performance",
+      "P3",
+      "area:logs"
+    ],
+    "body": "## Problem\nAfter `wait`, `_run_container_attempt` calls `_bounded_logs` (`pipelines/definition.py:314`), which opens a second non-follow stream and reads the container's whole log history from the daemon (`pipelines/definition.py:165-178`) to keep the last 64 KiB. For a node that logged gigabytes, this downloads everything a second time after the follower already read it. If streaming is disabled (`run_id` empty, `pipelines/definition.py:308`), the full read is the only read.\n\n## Proposal\nHave `_follow_logs` (or a small reader when no shipper exists) maintain a `collections.deque`-backed byte ring of `MLAIOPS_PIPELINE_LOG_LIMIT_BYTES` and return it. Fall back to `container.logs(tail=N)` (the Docker API supports `tail`) only when the follower failed.\n\n## Acceptance criteria\n- [ ] `container.logs` is called once per attempt in the happy path (fake container counts calls).\n- [ ] Tail content matches the current `_bounded_logs` behaviour (reuse `test_logs_are_a_bounded_tail`).\n- [ ] The fallback path uses `tail=` instead of reading the full history."
+  },
+  {
+    "title": "Accept Kubernetes resource quantities and report invalid resources as failed",
+    "labels": [
+      "bug",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\n`_cpu_nanos` accepts only `Nm` or whole integers (`pipelines/definition.py:136-143`), so `\"0.5\"` and `\"1.5\"` raise. `_memory_bytes` accepts only `Mi`, `Gi` or bytes (`pipelines/definition.py:146-154`), so `\"512M\"`, `\"1G\"`, `\"1.5Gi\"`, `\"256Ki\"` and `\"1Ti\"` raise. The contract uses Kubernetes quantities, and the gateway admits them. The resulting `ValueError` (also raised by `int(resources.get(\"gpu\"))` at `pipelines/definition.py:248`) is thrown at `pipelines/definition.py:373` before any `report_step`, so the node is never reported as `running` or `failed`. The gateway shows it stuck as pending while the flow fails.\n\n## Proposal\nImplement a full quantity parser (decimal and binary SI suffixes, decimal CPU values). Wrap kwargs construction so that any validation error is reported as `failed` with the message before re-raising.\n\n## Acceptance criteria\n- [ ] Parametrized tests: `0.5`, `1500m`, `2` CPU; `512M`, `1G`, `1.5Gi`, `256Ki` memory, with exact byte and nano values.\n- [ ] Test: `resources={\"memory\": \"lots\"}` produces exactly one `failed` report with a message that names the field.\n- [ ] Test: a non-integer `gpu` value is reported the same way."
+  },
+  {
+    "title": "Detect OOM kills, report them distinctly and disable swap for nodes",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\n`mem_limit` is set (`pipelines/definition.py:246-247`) but `memswap_limit` is not. Docker then lets the container use swap up to the same amount again, so memory-heavy nodes slow down instead of failing at the declared limit. When the kernel OOM-kills a node, the runner only sees an exit status (usually 137) and reports `container exited with status 137` (`pipelines/definition.py:315-318`). It never inspects `State.OOMKilled`, so users cannot tell an OOM from a crash. OOM failures are also retried as if transient (`pipelines/definition.py:385-390`).\n\n## Proposal\n- Set `memswap_limit = mem_limit`.\n- After `wait`, call `container.reload()` and read `attrs[\"State\"][\"OOMKilled\"]`. Report the fact `oom_killed: true` and the message `out of memory (limit 2Gi)`.\n- Add a job option `retry_on_oom` (default false).\n\n## Acceptance criteria\n- [ ] `_container_kwargs` test asserts `memswap_limit == mem_limit`.\n- [ ] Fake container with `OOMKilled: true` yields a failed report with `oom_killed` set and no retry when `retry_on_oom` is false.\n- [ ] Docker integration test: a node allocating 200 MiB with `memory: 64Mi` is reported as OOM."
+  },
+  {
+    "title": "Reject non-positive max_parallelism instead of failing with a scheduler error",
+    "labels": [
+      "bug",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\n`pipeline_definition` reads `int(definition.get(\"max_parallelism\") or 0)` (`pipelines/definition.py:523`) and applies only an upper bound (`pipelines/definition.py:538`). A negative value such as `-1` passes through. In `execute_ready_set`, `len(running) >= max_parallel` is then always true (`pipelines/definition.py:463`), so no node ever starts and the run fails with the misleading `nodes can never start: ...` (`pipelines/definition.py:480`). A non-numeric value raises an unreported `ValueError`.\n\n## Proposal\nClamp to `[1, MAX_PARALLEL]` with the same rules as `_bounded_setting`, or reject values below 1 with a clear flow error. Also assert `max_parallel >= 1` inside `execute_ready_set`.\n\n## Acceptance criteria\n- [ ] Test: `max_parallelism: -1` either runs with parallelism 1 or fails with `max_parallelism must be >= 1`, never with `nodes can never start`.\n- [ ] Test: `max_parallelism: \"abc\"` fails with a clear message.\n- [ ] Test: `execute_ready_set(..., max_parallel=0)` raises `ValueError` up front."
+  },
+  {
+    "title": "Validate when-conditions so a missing key cannot crash the scheduler",
+    "labels": [
+      "bug",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\n`condition_met` uses `.get` for `param` and `equals` (`pipelines/definition.py:409-414`), but the skip branch then indexes `condition['param']` and `condition['equals']` (`pipelines/definition.py:459-460`). A `when: {param: mode}` without `equals` evaluates as `str(value) == \"\"`, skips the node, and then raises `KeyError` inside the scheduling loop. The exception aborts the whole flow with running nodes still in flight. A non-dict `when` raises `AttributeError`. `definition_layers` does not validate `when` (`pipelines/definition.py:81-95`).\n\n## Proposal\nValidate `when` in `definition_layers`: it must be a dict with string `param` and a present `equals`. Use the validated values in the skip message.\n\n## Acceptance criteria\n- [ ] Test: `when: {param: mode}` is rejected by `definition_layers` with a message naming the job.\n- [ ] Test: `when: \"mode=x\"` is rejected.\n- [ ] Test: a valid condition produces the same skip message as today (`test_ready_set_condition_skips_node_and_dependents_still_run`)."
+  },
+  {
+    "title": "Stop running node containers when a flow run is cancelled",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\nContainers are removed only in the `finally` of `_run_container_attempt` (`pipelines/definition.py:335-344`). `execute_ready_set` has no cancellation hook. It polls until every handle is final (`pipelines/definition.py:441-481`) and keeps starting nodes. When a user cancels a run in Prefect, the served flow process is terminated, so the worker threads that own each container never reach `finally`. Containers (including GPU jobs) keep running with no owner, and the follower and shipper threads are daemons (`pipelines/definition.py:311`, `pipelines/report.py:71`), so buffered logs are lost too. A failure in one branch also never stops sibling nodes. There is no fail-fast option.\n\n## Proposal\n- Install a SIGTERM handler and use Prefect's cancellation hooks (`on_cancellation`) to stop containers labelled `io.kionga.pipeline.run-id=<run_id>` with a grace period, then remove them.\n- Pass a `threading.Event` into `execute_ready_set` so it stops starting new nodes and reports pending nodes as `cancelled`.\n- Add `fail_fast: true` to the definition so a failure cancels running siblings.\n\n## Acceptance criteria\n- [ ] Unit test: setting the cancel event stops scheduling, and pending nodes are reported `cancelled`.\n- [ ] Docker integration test: cancelling a flow with a `sleep 600` node removes the container within the grace period plus 5 s.\n- [ ] Test: with `fail_fast`, a failing node causes running siblings to be stopped and reported."
+  },
+  {
+    "title": "Reap orphaned node containers and their anonymous volumes at runner startup",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\nCleanup is best-effort: `container.remove(force=True)` (`pipelines/definition.py:342`) prints and continues on error (`pipelines/definition.py:343-344`). It does not pass `v=True`, so anonymous volumes created from an image's `VOLUME` declarations are left behind on every run. Containers already carry run, step and project labels (`pipelines/definition.py:230-234`), but nothing uses them. `serve.py` starts serving immediately (`pipelines/serve.py:16-20`), so containers orphaned by a crash or cancellation stay until an operator notices.\n\n## Proposal\n- Remove containers with `v=True`.\n- Add a reaper that runs on startup and every N minutes. It lists containers with label `io.kionga.pipeline.run-id`, asks the gateway (or Prefect) whether the run is still active, and removes containers of terminal or unknown runs older than a grace period, together with their volumes.\n- Add a `io.kionga.pipeline.runner-id` label so several runners on one host do not reap each other's containers.\n\n## Acceptance criteria\n- [ ] Test asserts `remove` is called with `force=True, v=True`.\n- [ ] Unit test for the reaper with a fake client: removes a container of a terminal run, keeps one of an active run.\n- [ ] Docker integration test: an image with `VOLUME /data` leaves no dangling volume after the step.\n- [ ] Reaper actions are logged with the run id and counted in a metric."
+  },
+  {
+    "title": "Reattach to or recover in-flight runs after a runner restart",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:prefect"
+    ],
+    "body": "## Problem\nThe runner executes flows in-process via `serve()` (`pipelines/serve.py:17-20`). If the runner container restarts (deploy, OOM, host reboot), in-flight flow runs die with it. Their node containers either keep running unobserved or are lost, and the gateway keeps the run in `running`. Resumption exists only as a gateway-driven `reuse` map of earlier outputs (`pipelines/definition.py:527-532`), which requires a human to trigger a rerun. Nothing reconnects to a container that is still running and labelled for the run (`pipelines/definition.py:230-234`).\n\n## Proposal\n- On `run_container_job` start, look for an existing container with the same run id, step and attempt labels. If one is running, reattach (follow logs and wait) instead of creating a duplicate. If it exited, collect its exit code and tail.\n- Configure Prefect so crashed runs are marked `Crashed`, and add an `on_crashed` hook that reports the run to the gateway so it can resubmit with `reuse` filled from succeeded steps.\n- Add an attempt label so reattachment is unambiguous.\n\n## Acceptance criteria\n- [ ] Unit test: an existing running container with matching labels is reattached, and `containers.create` is not called.\n- [ ] Unit test: an exited container with matching labels reports its real exit code.\n- [ ] Docker integration test: kill the runner process mid-node, restart, and the step finishes with one container created in total.\n- [ ] Crash hook posts a status the gateway can act on (contract documented)."
+  },
+  {
+    "title": "Make step reports idempotent, ordered and retried",
+    "labels": [
+      "reliability",
+      "P1",
+      "area:reporting"
+    ],
+    "body": "## Problem\n`report_step` makes one `httpx.post` with a 5 s timeout and only prints on failure (`pipelines/report.py:31-39`). A gateway blip during the final `succeeded` report (`pipelines/definition.py:397`) leaves the run stuck in `running` forever, even though the flow completed. Retrying naively is unsafe because the payload has no idempotency key or sequence number (`pipelines/report.py:29-30`). Concurrent nodes report from different threads, so the gateway cannot detect an out-of-order `running` that arrives after `succeeded`.\n\n## Proposal\n- Add `report_id` (uuid5 of run, step, attempt and status) sent as an `Idempotency-Key` header, plus a monotonically increasing `seq` per run.\n- Retry 5xx, 429 and connect errors with exponential backoff and jitter up to a deadline (for example 2 minutes). Do not retry 4xx.\n- Keep terminal reports (`succeeded`, `failed`) in a small on-disk outbox that is replayed on startup.\n- Share one `httpx.Client` for connection reuse.\n\n## Acceptance criteria\n- [ ] Test with `httpx.MockTransport`: 503, 503, 200 results in one logical report and three requests with the same idempotency key.\n- [ ] Test: a 400 is not retried.\n- [ ] Test: `seq` strictly increases across concurrent reports for one run.\n- [ ] Test: an outbox entry written before a simulated crash is replayed on the next start."
+  },
+  {
+    "title": "Report each failed attempt and use exponential backoff with retry classification",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\nIn `run_container_job` a failed non-final attempt jumps straight to the next `running` report (`pipelines/definition.py:385-390`). The gateway never learns that attempt 1 exited with code 2 or which container ran it. Backoff is a constant `retry_backoff_seconds` (`pipelines/definition.py:366`, `pipelines/definition.py:388-389`) with no growth or jitter. `_run_container_attempt` wraps every exception as `ContainerJobError` (`pipelines/definition.py:322-334`), so deterministic errors (invalid command, image pull denied, bad device request) are retried as often as transient daemon errors.\n\n## Proposal\n- Report `failed` with `attempt`, `exit_code`, `workload_id` and `will_retry: true` for every non-final failure.\n- Add `retry_backoff_multiplier` and `retry_backoff_max_seconds`, plus jitter.\n- Classify errors: `docker.errors.ImageNotFound`, auth errors, `InvalidArgument` and container creation 400s are not retryable. Exit codes can be listed in `retry_on_exit_codes`.\n\n## Acceptance criteria\n- [ ] Test: 2 retries with a failing first attempt produce reports `running(1)`, `failed(1, will_retry)`, `running(2)`, `succeeded(2)`.\n- [ ] Test: sleeps follow `base * multiplier^n` capped at the max (jitter patched out).\n- [ ] Test: an `APIError` with status 400 on create fails after one attempt despite `retries: 3`."
+  },
+  {
+    "title": "Stop timed-out nodes gracefully and detect timeouts by exception type",
+    "labels": [
+      "reliability",
+      "P3",
+      "area:executor"
+    ],
+    "body": "## Problem\nTimeouts are detected by substring matching on the error text (`pipelines/definition.py:329`), which depends on `requests`/`urllib3` message wording and also matches unrelated errors that say \"timed out\" (for example a registry timeout during create). On timeout the container is removed with `force=True` (`pipelines/definition.py:342`), which sends SIGKILL immediately. Jobs get no SIGTERM and cannot checkpoint, although the module docstring says the writable filesystem exists for checkpoints (`pipelines/definition.py:12-13`). The timeout report has no `exit_code` and no distinct fact.\n\n## Proposal\nWrap only `container.wait` in a `try` that catches `requests.exceptions.ReadTimeout`/`ConnectionError` by type. On timeout, call `container.stop(timeout=grace)` (configurable `stop_grace_seconds`, default 30) before removal. Report `timed_out: true` and the exit code after stop.\n\n## Acceptance criteria\n- [ ] Unit test: a fake `wait` raising `ReadTimeout` results in `stop(timeout=30)` before `remove`, and the report has `timed_out` set.\n- [ ] Unit test: an `APIError` whose text contains \"timed out\" during create is not classified as a node timeout.\n- [ ] Docker integration test: a node trapping SIGTERM writes a marker file before exit."
+  },
+  {
+    "title": "Pass node outputs as size-checked artifacts instead of parsed stdout in env vars",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:artifacts"
+    ],
+    "body": "## Problem\nA node's output is guessed from its combined stdout and stderr tail. `_dependency_output` tries the whole 64 KiB tail as JSON, then the last line, then falls back to the raw text (`pipelines/definition.py:181-189`). A trailing stderr warning silently turns the output into a string. Outputs are passed downstream in the `KIONGA_DEPENDENCY_OUTPUTS` env var (`pipelines/definition.py:207-209`) with no size check, even though the module docstring promises bounded variables (`pipelines/definition.py:5-6`). Linux rejects a single env string over 128 KiB, so a large fan-in fails at `containers.create` with an opaque error. There is no way to pass files (datasets, model checkpoints) between nodes.\n\n## Proposal\n- Mount a per-run work volume. Each node writes `/kionga/outputs/result.json` and files under `/kionga/outputs/files/`. The runner reads `result.json` via `get_archive` after exit.\n- Downstream nodes get upstream outputs at `/kionga/inputs/<node>/` (read-only) and a small `KIONGA_DEPENDENCY_OUTPUTS` index.\n- Enforce a size limit on `result.json` and on the env index, and fail with a clear message when exceeded.\n- Keep stdout parsing as a deprecated fallback for one release.\n\n## Acceptance criteria\n- [ ] Docker integration test: node A writes `result.json` and a file, and node B reads both.\n- [ ] Unit test: outputs larger than the limit fail the producing step with a size message.\n- [ ] Unit test: a stderr line after the JSON no longer corrupts the output when `result.json` is present.\n- [ ] README documents the node I/O contract."
+  },
+  {
+    "title": "Assign specific GPUs to nodes and schedule around GPU availability",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:executor"
+    ],
+    "body": "## Problem\n`_gpu_device_requests` builds `DeviceRequest(count=count, capabilities=[[\"gpu\"]])` (`pipelines/definition.py:128-133`) with no `device_ids`. Two concurrent nodes that each request one GPU are both given the same device by the NVIDIA runtime, which leads to contention or CUDA OOM. `execute_ready_set` limits parallelism only by node count (`pipelines/definition.py:463`) and has no notion of GPU capacity. Requesting more GPUs than the host has fails at create time and is then retried (`pipelines/definition.py:322-334`).\n\n## Proposal\n- Discover GPUs at startup (`MLAIOPS_PIPELINE_GPUS=0,1,2,3` or `nvidia-smi -L`).\n- Add a GPU allocator shared across flow runs in the process. A node waits until enough devices are free and then gets `device_ids=[...]`.\n- Fail fast with a clear message when a node requests more GPUs than exist.\n- Report the assigned GPU ids as a step fact.\n\n## Acceptance criteria\n- [ ] Unit test: two 1-GPU nodes on a 2-GPU host get distinct `device_ids`.\n- [ ] Unit test: a third concurrent 1-GPU node waits until one is released.\n- [ ] Unit test: requesting 3 GPUs on a 2-GPU host fails without a container create and without retry.\n- [ ] Step reports include `gpu_ids`."
+  },
+  {
+    "title": "Add a runner-wide container concurrency limit and explicit deployment config",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:prefect"
+    ],
+    "body": "## Problem\nParallelism is bounded per flow run (`pipelines/definition.py:523-525`, up to `MAX_PARALLEL=64` at `pipelines/definition.py:53`). `serve()` is called with no `limit` (`pipelines/serve.py:17-20`), so ten concurrent runs can start 640 containers on one host. Both deployments use the same name `mlaiops` (`pipelines/serve.py:18-19`) with no version, tags, description, concurrency limit or parameter schema, so operators cannot tell what code a deployment runs from the Prefect UI.\n\n## Proposal\n- Add `MLAIOPS_RUNNER_MAX_FLOW_RUNS` passed to `serve(limit=...)`.\n- Add a process-wide semaphore `MLAIOPS_RUNNER_MAX_CONTAINERS` acquired in `run_container_job` around each attempt. Nodes waiting on it stay `pending` (report `queued`).\n- Set `version` (image tag or git SHA from a build arg), `tags`, `description` and `concurrency_limit` on each `to_deployment` call.\n\n## Acceptance criteria\n- [ ] Unit test: with the container limit at 2 and two flows of 3 parallel nodes each, at most 2 containers are ever started at once.\n- [ ] `main()` test (monkeypatched `serve`) asserts `limit` and the deployment versions and tags.\n- [ ] Both settings are documented in the README table."
+  },
+  {
+    "title": "Pin Prefect and all runtime dependencies with a hashed lock file",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:prefect"
+    ],
+    "body": "## Problem\n`requirements.txt` pins scikit-learn, mlflow and docker, but leaves `prefect>=3.0`, `httpx>=0.27` and `boto3>=1.34` open (`requirements.txt:4,7,8`). The Dockerfile installs from this file without hashes (`Dockerfile:14`). Every image build can pick up a new Prefect minor version with changed `serve`, task runner or future-state semantics. `_PrefectHandle.done` already relies on `future.state` details (`pipelines/definition.py:502-506`), and a server/client version mismatch with the Compose Prefect server would break runs. The Dockerfile comment says unpinned versions cause skew (`Dockerfile:5-8`), but transitive dependencies are not pinned either.\n\n## Proposal\nKeep `requirements.in` with direct dependencies and generate `requirements.txt` with `pip-compile --generate-hashes` (or `uv pip compile`). Install with `--require-hashes`. Pin Prefect to the server version used in kiongahq/deploy. Add Renovate or Dependabot for controlled bumps.\n\n## Acceptance criteria\n- [ ] `requirements.txt` contains exact versions and hashes for all transitive dependencies.\n- [ ] Dockerfile installs with `--require-hashes`.\n- [ ] CI fails if `requirements.txt` is out of date with `requirements.in`.\n- [ ] README states the supported Prefect server version."
+  },
+  {
+    "title": "Expose Prometheus metrics and OpenTelemetry traces for runs and nodes",
+    "labels": [
+      "observability",
+      "P2",
+      "area:observability"
+    ],
+    "body": "## Problem\nThe runner has no metrics or traces. Operational signals exist only as `print` lines: failed step reports (`pipelines/report.py:39`), dropped log batches (`pipelines/report.py:112`) and failed container cleanup (`pipelines/definition.py:344`). Operators cannot alert on lost reports, log drops, leaked containers, queueing delay or node durations, and cannot correlate a gateway request with the runner work it triggered.\n\n## Proposal\n- Add a `prometheus_client` endpoint (`MLAIOPS_RUNNER_METRICS_PORT`) with: `kionga_node_duration_seconds{status}`, `kionga_node_attempts_total{result}`, `kionga_containers_running`, `kionga_step_report_failures_total`, `kionga_log_lines_dropped_total`, `kionga_container_cleanup_failures_total`, `kionga_image_pull_seconds`.\n- Add OpenTelemetry spans for flow, node attempt, image pull and report POST. Propagate `traceparent` on gateway requests and into containers as `TRACEPARENT`.\n\n## Acceptance criteria\n- [ ] Unit test scrapes the registry after a fake successful and failed node and asserts counter values.\n- [ ] A failed `report_step` increments `kionga_step_report_failures_total`.\n- [ ] Gateway requests carry a `traceparent` header (MockTransport test).\n- [ ] README lists every metric and its labels."
+  },
+  {
+    "title": "Replace print calls with structured logging that carries run and node context",
+    "labels": [
+      "observability",
+      "P3",
+      "area:observability"
+    ],
+    "body": "## Problem\nRunner diagnostics use bare `print` (`pipelines/report.py:39`, `pipelines/report.py:112`, `pipelines/definition.py:344`). They have no level, no timestamp, and no run id, node or attempt, and they bypass Prefect's run logger, so they do not appear in the Prefect UI for the run that caused them. The failure messages also include the exception text, which may contain URLs with tokens.\n\n## Proposal\nUse `prefect.get_run_logger()` when inside a flow or task context, and fall back to a module `logging.getLogger(\"kionga.runner\")` with a JSON formatter. Include `run_id`, `node`, `attempt` and `workload_id` as structured fields. Pass messages through the redactor.\n\n## Acceptance criteria\n- [ ] No `print(` remains in `pipelines/` (enforced by a ruff `T20` rule in `pyproject.toml`).\n- [ ] Test with `caplog`: a failed report logs at WARNING with `run_id` and `step` fields.\n- [ ] Cleanup failure logs include the container id."
+  },
+  {
+    "title": "Record dataset version, code version and Kionga ids in MLflow training runs",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:training"
+    ],
+    "body": "## Problem\nThe training flow cannot be traced back to its inputs:\n- `training_pipeline` discards its `parameters` (`pipelines/training.py:121`).\n- Data is always `make_classification` (`pipelines/training.py:28-35`), with no dataset reference or content hash.\n- `log_to_mlflow` logs only the model class and `random_state` (`pipelines/training.py:76`).\n- It adds no tags for the Kionga `run_id` or `project_id`, the image digest, the git SHA, or library versions.\n- The experiment name is a global `training-pipeline` for all projects (`pipelines/training.py:74`).\n\nGiven an MLflow model version, there is no way to find the Kionga run, the project or the data that produced it.\n\n## Proposal\n- Accept `dataset_uri`, `dataset_version` and hyperparameters via `parameters`, falling back to the synthetic dataset only when no dataset is given.\n- Compute a SHA-256 of the training data and log it with `mlflow.log_input`.\n- Tag runs with `kionga.run_id`, `kionga.project_id`, `kionga.runner_version` and `sklearn_version`.\n- Use a per-project experiment name.\n\n## Acceptance criteria\n- [ ] Test with a local file-store `MLFLOW_TRACKING_URI` (tmp_path): the run has the tags, the params from `parameters` and a dataset input with a digest.\n- [ ] Test: different `parameters[\"C\"]` values change the logged param and model.\n- [ ] Two projects log to different experiments."
+  },
+  {
+    "title": "Scope registered model names per project and make registration idempotent",
+    "labels": [
+      "bug",
+      "P2",
+      "area:training"
+    ],
+    "body": "## Problem\nEvery project registers into the same MLflow model `churn-classifier` (`pipelines/training.py:20`, `pipelines/training.py:79`), so versions from different projects are interleaved in one registry entry. When MLflow is not configured, the version falls back to `str(int(time.time()))` (`pipelines/training.py:103`), which collides for runs registered in the same second, and the artifact URI falls back to `models:/churn-classifier/latest` (`pipelines/training.py:104`), which points at whatever is latest, not this run's model. `register_with_control_plane` has no retry or idempotency key (`pipelines/training.py:98-109`). A gateway failure after MLflow registration fails the flow, and a rerun registers a second MLflow version for the same training.\n\n## Proposal\n- Name models `<project_id>-churn-classifier` or use a project tag plus a per-project name from `parameters`.\n- Use the Kionga `run_id` as the fallback version and send it as an idempotency key to `/api/v1/models`.\n- Do not register a placeholder artifact URI. Fail clearly if there is no artifact.\n- Retry transient gateway errors. On rerun, look up an existing MLflow run tagged with the same `kionga.run_id` before logging a new one.\n\n## Acceptance criteria\n- [ ] Test: two projects produce two distinct registered model names.\n- [ ] Test: without MLflow, the registered version equals the run id, and no `models:/.../latest` URI is sent.\n- [ ] Test (MockTransport): 503 then 201 posts once logically with the same idempotency key.\n- [ ] Test: rerunning with the same run id does not create a second MLflow model version."
+  },
+  {
+    "title": "Add Docker integration tests that run real containers in CI",
+    "labels": [
+      "testing",
+      "P2",
+      "area:testing"
+    ],
+    "body": "## Problem\nEvery executor test uses `FakeDockerClient`/`FakeContainer` (`tests/test_pipeline_definition.py:12-61`). The fake `wait` returns immediately and never times out (`tests/test_pipeline_definition.py:23-25`), and `logs` ignores `follow` and `stream` (`tests/test_pipeline_definition.py:27-28`). The following are never exercised against a real daemon: kwargs accepted by docker-py 7.1.0, timeout behaviour, `ImageNotFound` pull fallback, cleanup, log follow ordering, `cap_drop`/`pids_limit` enforcement, and env size limits. CI only runs the shared Python workflow and the image build (`.github/workflows/ci.yml:10-19`).\n\n## Proposal\nAdd `tests/integration/` marked `@pytest.mark.docker`, skipped when no daemon is reachable. Use `busybox`/`alpine` pinned by digest. Add a CI job on `ubuntu-latest` (which has Docker) that runs `pytest -m docker`.\n\nCases to cover:\n- success with output passing\n- non-zero exit\n- timeout (`sleep 30` with a 2 s timeout)\n- `pids_limit` (fork bomb is contained)\n- memory limit and OOM\n- cleanup (no leftover containers or volumes by label)\n- log streaming order and cap\n- pull of a missing image\n\n## Acceptance criteria\n- [ ] `pytest -m docker` runs at least the eight cases above against a real daemon.\n- [ ] A new CI job runs them on every PR and fails the build on regression.\n- [ ] After the suite, `docker ps -a --filter label=io.kionga.pipeline.run-id` is empty (asserted in a session fixture).\n- [ ] Unit tests still pass with no Docker installed."
+  },
+  {
+    "title": "Test serve.py deployments and full flow runs with the Prefect test harness",
+    "labels": [
+      "testing",
+      "P3",
+      "area:prefect"
+    ],
+    "body": "## Problem\n`pipelines/serve.py` has no tests. Flow-level tests call `run_container_job.fn` directly or monkeypatch `run_container_job.submit` (for example `tests/test_pipeline_definition.py:222`, `tests/test_pipeline_definition.py:390`), so `_PrefectHandle` (`pipelines/definition.py:498-509`) and the real task runner path are never exercised. A Prefect upgrade that changes `PrefectFuture.state` or `to_deployment` would pass CI. The `training_pipeline` flow as a whole (`pipelines/training.py:112-131`) is also untested. Only its tasks are covered (`tests/test_pipelines.py:12-26`).\n\n## Proposal\nUse `prefect.testing.utilities.prefect_test_harness` in a session fixture.\n- Run `pipeline_definition` with `_docker_client` patched to the fake and real task submission. Assert outputs and report order.\n- Run `training_pipeline` end to end with reporting mocked.\n- Call `main()` with `prefect.serve` patched and assert the deployment names, flows and settings.\n\n## Acceptance criteria\n- [ ] A flow test executes through real `run_container_job.submit` and `_PrefectHandle`.\n- [ ] A `training_pipeline` flow test asserts four `running`/`succeeded` step pairs.\n- [ ] A `serve.main` test asserts two deployments named `mlaiops` for the expected flows.\n- [ ] Tests run in CI in under 60 s."
+  },
+  {
+    "title": "Document the node container contract, all settings and the threat model",
+    "labels": [
+      "docs",
+      "P3",
+      "area:docs"
+    ],
+    "body": "## Problem\nThe README settings table (`README.md:30-40`) omits `MLAIOPS_PIPELINE_MAX_PARALLEL` (`pipelines/definition.py:524`) and the definition-level `max_parallelism`, `reuse`, `when`, `retries`, `retry_backoff_seconds` and `timeout_seconds` fields read in `pipelines/definition.py`. Image authors have no documentation of what their container receives or must emit:\n- the `KIONGA_RUN_ID`, `KIONGA_PROJECT_ID`, `KIONGA_STEP_NAME`, `KIONGA_PARAMETERS` and `KIONGA_DEPENDENCY_OUTPUTS` variables (`pipelines/definition.py:201-210`)\n- the rule that the output is the JSON on the final stdout/stderr line (`pipelines/definition.py:181-189`)\n- the forwarded platform variables (`pipelines/definition.py:38-47`)\n- the default limits of 500m CPU, 1Gi memory and 256 PIDs (`pipelines/definition.py:33-36`)\n\nThe trust boundary is stated in one sentence (`README.md:20-22`) without listing what a node can reach.\n\n## Proposal\nAdd `docs/node-contract.md` (inputs, outputs, limits, exit code semantics, retries), `docs/configuration.md` (every env var with default and bounds), and `docs/security.md` (Docker socket trust boundary, what nodes can reach, credential handling). Include a minimal example node image.\n\n## Acceptance criteria\n- [ ] Every `os.environ` read in `pipelines/` appears in the configuration doc (checked by a test that greps the source and the doc).\n- [ ] The node contract doc includes a working example image that the Docker integration suite runs.\n- [ ] README links to all three documents."
+  },
+  {
+    "title": "Harden the runner image with a non-root user, healthcheck and socket proxy option",
+    "labels": [
+      "security",
+      "P3",
+      "area:deploy"
+    ],
+    "body": "## Problem\nThe Dockerfile runs `python -m pipelines.serve` as root (`Dockerfile:9-23`), with no `USER`, no `HEALTHCHECK` and no `STOPSIGNAL`/shutdown handling. The runner talks to the Docker socket with full API access (`pipelines/definition.py:119-125`), so any code execution bug in the runner (for example via a malicious definition payload) has root on the host. It uses only `containers.create/start/wait/logs/remove` and `images.pull`, but nothing restricts it to those endpoints.\n\n## Proposal\n- Create a `runner` user and run as that user, with group access to the socket via a documented `group_add`.\n- Add a `HEALTHCHECK` that confirms the Prefect API and Docker daemon are reachable.\n- Document and support `DOCKER_HOST=tcp://docker-socket-proxy:2375`, with a proxy config that allows only the containers, images and info endpoints the runner uses.\n\n## Acceptance criteria\n- [ ] `docker run --rm ghcr.io/kiongahq/pipeline-runner id -u` is not 0.\n- [ ] The image has a `HEALTHCHECK` that fails when the Docker daemon is unreachable (integration test).\n- [ ] The Docker integration suite passes through a socket proxy restricted to the documented endpoints.\n- [ ] `docs/security.md` describes the proxy setup."
+  }
+]

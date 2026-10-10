@@ -1,0 +1,290 @@
+[
+  {
+    "title": "Treat Docker 404 on container create and start as a deploy failure",
+    "labels": [
+      "bug",
+      "P1",
+      "area:manager"
+    ],
+    "body": "## Problem\n`Manager.do` exempts every 404 from error handling (`internal/serving/manager.go:112`), not only the delete path that needs it. `POST /containers/create` returns 404 `No such image` when the serving image is missing locally. In that case `Deploy` gets `err == nil` with an empty `created.ID` (`manager.go:239`), calls `POST /containers//start` (`manager.go:242`), and a 404 there is also swallowed. It then returns `http://mlaiops-serve-<name>:5001` as a live endpoint (`manager.go:245`), and the handler replies 201 (`cmd/serving-manager/main.go:77`). This contradicts `README.md:6-7` (\"A rejected start is reported back as a failure, never as a live endpoint\"). `created.ID` is also concatenated into the path without escaping.\n\n## Proposal\n- Have `do` return a typed `ErrNotFound` for 404 and let only `Undeploy` treat it as success via `errors.Is`.\n- Reject an empty `created.ID` and `url.PathEscape` it before the start call.\n- If the image is missing, return a clear error. Optionally pull it first (`POST /images/create`) when `SERVE_PULL_POLICY=IfNotPresent`.\n\n## Acceptance criteria\n- [ ] Test: when the fake engine returns 404 on `/containers/create`, `Deploy` returns an error and no `/start` call is made.\n- [ ] Test: a 404 on `/containers/{id}/start` makes `Deploy` fail.\n- [ ] `TestUndeployMissingContainerIsNoError` still passes.\n- [ ] `List` returns an error when `/containers/json` returns 404."
+  },
+  {
+    "title": "Fail closed when MLAIOPS_INTERNAL_TOKEN is unset and compare tokens in constant time",
+    "labels": [
+      "security",
+      "P1",
+      "area:security"
+    ],
+    "body": "## Problem\n`authorized` returns true for every request when `MLAIOPS_INTERNAL_TOKEN` is empty (`cmd/serving-manager/main.go:96-99`). `README.md:22-23` documents this behavior. This service holds the Docker socket, which is root-equivalent on the host (`README.md:36`), so with no token set anyone who can reach port 8085 can start arbitrary images. Three more gaps:\n- The comparison uses `==`, which is not constant time.\n- `strings.TrimPrefix` also accepts a bare token sent without the `Bearer ` scheme.\n- `runtimeconfig.ValidateGateway` (`internal/runtimeconfig/config.go:79`) enforces token strength, but serving-manager never calls it. `main.go:20` calls only `Load`.\n\n## Proposal\n- Refuse to start without a token unless `SERVING_ALLOW_UNAUTHENTICATED=true` is set explicitly. Log a warning at startup when it is.\n- Parse `Authorization` strictly as `Bearer <token>` and compare with `crypto/subtle.ConstantTimeCompare`.\n- Add `runtimeconfig.ValidateServing()` that requires a token of 24 or more characters when `KIONGA_ENVIRONMENT=production`.\n\n## Acceptance criteria\n- [ ] With no token and no opt-in flag, the process exits non-zero with a clear message.\n- [ ] Handler test: missing header, wrong scheme, bare token and wrong token all return 401. A correct `Bearer` token returns 200.\n- [ ] Unit test for `ValidateServing` rejects short or `change-me` tokens in production.\n- [ ] README auth section updated."
+  },
+  {
+    "title": "Stop injecting platform S3 and MLflow credentials into untrusted model containers",
+    "labels": [
+      "security",
+      "P1",
+      "area:security"
+    ],
+    "body": "## Problem\n`main.go:24-28` copies `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `MLFLOW_S3_ENDPOINT_URL` and `MLFLOW_TRACKING_URI` into `Manager.Env`. `Deploy` passes them to every serving container (`internal/serving/manager.go:221`). The code itself calls these containers untrusted (`manager.go:47`). Loading an MLflow pyfunc or pickle model runs arbitrary Python, so every model author gets the platform's object store credentials. Those credentials are also readable through `docker inspect` by anyone with Docker access.\n\n## Proposal\n- Fetch artifacts on the manager side (see the artifact cache issue) and mount them read-only, so model containers need no store credentials.\n- Until then, mint per-deployment, read-only, prefix-scoped, short-lived credentials (STS `AssumeRole` with a session policy, or a MinIO service account). Deliver them as a mounted file, not as env vars.\n- Add a `SERVE_PASS_CREDENTIALS=false` default.\n\n## Acceptance criteria\n- [ ] Test: by default the create payload `Env` contains no `AWS_SECRET_ACCESS_KEY`.\n- [ ] Test: with scoped credentials enabled, the env contains only the per-deployment key ID and never the manager's own secret.\n- [ ] Integration test: a model container cannot list a bucket prefix outside its own artifact.\n- [ ] Threat model documented in README."
+  },
+  {
+    "title": "Restrict serving_image to allowlisted registries and pinned digests",
+    "labels": [
+      "security",
+      "P1",
+      "area:security"
+    ],
+    "body": "## Problem\nCallers pick any image through `serving_image` (`cmd/serving-manager/main.go:64`). `normalizeImage` checks only for control characters and whitespace (`internal/serving/manager.go:164-179`). The chosen image then runs on the platform network with the injected credentials (`manager.go:221,229`). A compromised gateway account, or the unauthenticated default, can run any public image next to the database. Mutable tags such as `:3` also mean the image actually served can change between restarts.\n\n## Proposal\n- Add `SERVE_IMAGE_ALLOWED_PREFIXES` (for example `ghcr.io/kiongahq/,registry.internal/models/`) and reject images outside it.\n- In production, require an `@sha256:` digest. Resolve tags to digests at deploy time and record the digest in the `mlaiops.image` label.\n- Optional: verify cosign signatures before create.\n\n## Acceptance criteria\n- [ ] Table test: `docker.io/evil/x:latest` is rejected and an allowlisted digest reference is accepted.\n- [ ] In production mode a tag-only reference is rejected with a 422 and a clear message.\n- [ ] The label records the resolved digest. The test asserts it.\n- [ ] README documents the allowlist variable."
+  },
+  {
+    "title": "Gate the live endpoint on model readiness, not container start",
+    "labels": [
+      "reliability",
+      "P1",
+      "area:manager"
+    ],
+    "body": "## Problem\n`Deploy` returns the endpoint as soon as `/containers/{id}/start` succeeds (`internal/serving/manager.go:242-245`). At that point `mlflow models serve` has not downloaded the model or imported its framework, and it can still crash on a missing dependency. Because of `RestartPolicy: unless-stopped` (`manager.go:230`), a crash-looping container shows as `running` or `restarting` in `List` (`manager.go:276`). The gateway therefore records an endpoint that cannot serve, which breaks the README promise (`README.md:6-7`).\n\n## Proposal\n- Add a Docker `Healthcheck` to the create payload that probes the runtime's health path (`/ping` for MLflow).\n- After start, poll `GET /containers/{id}/json` until `State.Health.Status == healthy` or `SERVE_READY_TIMEOUT` (default 300s) passes. Fail fast on `exited` or when `RestartCount > 0`.\n- On failure, include the last 50 log lines (`/containers/{id}/logs?tail=50`) in the error, then remove the container.\n- For long loads, support an async mode: return 202 with `state: loading`, and let the platform poll `GET /deployments/{name}`.\n\n## Acceptance criteria\n- [ ] Test with a fake engine that reports `starting` then `healthy`: `Deploy` returns only after `healthy`.\n- [ ] Test: `unhealthy` or `exited` returns an error that includes the log tail, and the container is removed.\n- [ ] Test: the timeout is honored with an injected clock.\n- [ ] The create payload contains a `Healthcheck`, asserted in the test."
+  },
+  {
+    "title": "Replace a running deployment without downtime and clean up failed starts",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:manager"
+    ],
+    "body": "## Problem\n`Deploy` removes the current container first and ignores the result (`_ = m.Undeploy(ctx, name)`, `internal/serving/manager.go:211`). It then creates and starts the new one (`manager.go:239-244`). Consequences:\n- If create or start fails (bad image, bad artifact), the previous working version is already gone.\n- If start fails, the newly created container stays in `created` state and keeps the name.\n- If `Undeploy` fails with a 5xx, create hits a 409 name conflict that the caller sees as a 422 (`cmd/serving-manager/main.go:74`).\n- The call uses `r.Context()`, so a gateway disconnect partway through leaves the model with no container.\n\n## Proposal\n- Create the new revision under a revision-specific name (`<name>-<shortrev>`) and wait for readiness.\n- Then move the stable DNS alias with `POST /networks/{id}/connect` and `Aliases: [mlaiops-serve-<name>]`, and only then remove the old container.\n- On any failure, remove the new container and leave the old one untouched.\n- Run the operation on a detached context with its own deadline.\n\n## Acceptance criteria\n- [ ] Test: when start fails, the old container is never deleted and the new container is removed.\n- [ ] Test: the call order is create(new), start(new), ready, alias switch, delete(old).\n- [ ] Test: cancelling the request context mid-deploy does not delete the old container.\n- [ ] The endpoint string stays `http://mlaiops-serve-<name>:5001` for compatibility."
+  },
+  {
+    "title": "Serialize per-model operations and fix the lazy HTTP client data race",
+    "labels": [
+      "bug",
+      "P2",
+      "area:manager"
+    ],
+    "body": "## Problem\n`Manager` has no locking (`internal/serving/manager.go:28-51`). Two concurrent `POST /deployments` for the same name interleave at `manager.go:211` and `manager.go:239`. One gets a 409, or one deletes the container the other just started. `httpClient()` reads and writes `m.client` lazily without synchronization (`manager.go:65-80`). Concurrent first requests from `net/http` handler goroutines race on it, and `go test -race` would flag that once a concurrent test exists.\n\n## Proposal\n- Build the `http.Client` once in `NewManager`, or guard it with `sync.Once`.\n- Add a keyed mutex (per `containerName`) held across Deploy, Undeploy and rollback for one model, so different models still run in parallel.\n\n## Acceptance criteria\n- [ ] A test fires 20 concurrent `Deploy` calls for one name against the fake engine under `-race`. It ends with exactly one container and no race report.\n- [ ] A test shows that deploys for two different names run concurrently (no global lock).\n- [ ] `make verify` passes under `-race`."
+  },
+  {
+    "title": "Map Docker failures to typed errors, correct HTTP status codes and per-call timeouts",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nEvery engine call shares one fixed 60s client timeout (`internal/serving/manager.go:70,73`). The POST handler returns 422 for every `Deploy` error (`cmd/serving-manager/main.go:73-74`), including \"docker engine unreachable\" (`manager.go:108`), engine 5xx and 409 conflicts. The gateway cannot tell bad input from a transient engine fault, so it cannot decide whether to retry. Raw Docker response bodies are also forwarded to callers (`manager.go:113`, `main.go:51,85`), which exposes engine internals.\n\n## Proposal\n- Define `ErrInvalidInput`, `ErrConflict`, `ErrEngineUnavailable` and `ErrNotReady`. Map them to 400/422, 409, and 503 with `Retry-After`.\n- Set per-operation deadlines via context (list 10s, delete 30s, create 30s, readiness its own budget).\n- Retry idempotent GET and DELETE calls with bounded exponential backoff.\n- Log full engine errors server-side and return a stable error code plus a short message.\n\n## Acceptance criteria\n- [ ] Handler test: engine unreachable returns 503, empty name returns 400/422, and a name conflict returns 409.\n- [ ] Test: a hanging fake engine causes `List` to return within its deadline.\n- [ ] Test: a transient 500 on `GET /containers/json` is retried and then succeeds.\n- [ ] Response bodies contain no raw Docker JSON."
+  },
+  {
+    "title": "Validate model name and artifact_uri schemes before launching a container",
+    "labels": [
+      "security",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\n`Deploy` checks only that `name` and `artifactURI` are non-empty (`internal/serving/manager.go:186-190`). The URI goes straight to `mlflow models serve -m` (`manager.go:216`), so a caller can point at `file:///` paths inside the image, at arbitrary `http(s)://` hosts, or at buckets outside the platform store. `name` has no length or charset limit. It flows into labels (`manager.go:224`) and into `containerName`, where names that differ only in case map to different hashed containers (`manager.go:128-162`). The platform likely treats those as the same model.\n\n## Proposal\n- Allow only `models:/`, `runs:/`, and `s3://<configured bucket>/` (setting `SERVE_ARTIFACT_ALLOWED_PREFIXES`).\n- Enforce `^[a-z0-9][a-z0-9-]{0,62}$` on new names, or document a case-folding rule, and cap URI length at 2 KiB.\n- Return 400 with a field-level error.\n\n## Acceptance criteria\n- [ ] Table test rejects `file:///etc/passwd`, `http://attacker/x` and a 5 KiB URI, and accepts `models:/churn/3`.\n- [ ] Test covers name rules, including the existing `TestContainerNameIsStableDNSLabelForUnsafeModelName` cases.\n- [ ] Handler test returns 400 with `field: artifact_uri`."
+  },
+  {
+    "title": "Harden serving containers with read-only rootfs, non-root user, seccomp and log limits",
+    "labels": [
+      "security",
+      "P2",
+      "area:security"
+    ],
+    "body": "## Problem\nThe create payload sets only `CapDrop: ALL`, `no-new-privileges` and `PidsLimit` (`internal/serving/manager.go:228-234`). It is missing:\n- `ReadonlyRootfs`\n- a non-root `User`\n- an explicit `seccomp` profile (`SecurityOpt` replaces defaults when set by some engines)\n- `Tmpfs` for `/tmp`\n- `Ulimits` for `nofile`\n- `LogConfig` size limits\n\nA verbose model can fill the host disk through the json-file log driver. Root inside the container widens the impact of a container escape.\n\n## Proposal\n- Add `ReadonlyRootfs: true` and `Tmpfs: {\"/tmp\": \"rw,noexec,nosuid,size=512m\"}`, plus a writable model cache mount.\n- Set `User` (default `65532:65532`, override `SERVE_USER`) and `SecurityOpt: [no-new-privileges, seccomp=<profile>]`.\n- Set `LogConfig: {Type: json-file, Config: {max-size: 10m, max-file: 3}}`.\n- Make each control overridable per runtime only through an allowlisted profile.\n\n## Acceptance criteria\n- [ ] Extend `TestDeployCreatesAndStartsContainer` to assert each field.\n- [ ] Integration test: writing to `/` inside a running MLflow container fails, `id -u` is not 0, and `/ping` still returns 200.\n- [ ] README lists the hardening defaults and image requirements (writable paths)."
+  },
+  {
+    "title": "Move model containers off the platform control-plane network",
+    "labels": [
+      "security",
+      "P2",
+      "area:security"
+    ],
+    "body": "## Problem\nServing containers join `NetworkMode: m.Network` (`internal/serving/manager.go:229`). That defaults to `mlaiops_default` (`cmd/serving-manager/main.go:29`), the same network as the gateway, Postgres, Redis, MLflow and this manager's own API on :8085. Untrusted model code can open connections to every control-plane service. With the token unset (`main.go:96-99`), that includes calling `POST /deployments` to launch more containers.\n\n## Proposal\n- Add `SERVE_NETWORK`, a dedicated serving network. Only the router and gateway join it, and model containers join nothing else.\n- Give the artifact store a dedicated egress path, or remove the need for it via the artifact cache.\n- Document an `internal: true` Docker network option for fully offline models.\n\n## Acceptance criteria\n- [ ] Test: the create payload uses `SERVE_NETWORK` when it is set.\n- [ ] Integration test: from a model container, a TCP connect to the Postgres service name fails, and the router can still reach the model.\n- [ ] The deploy repo compose change is linked and the README updated."
+  },
+  {
+    "title": "Support TLS client authentication for remote Docker engines",
+    "labels": [
+      "security",
+      "P2",
+      "area:manager"
+    ],
+    "body": "## Problem\n`DOCKER_HOST_URL` sets `Manager.BaseURL` (`cmd/serving-manager/main.go:34-36`). `httpClient` then builds a plain `http.Client` with no TLS configuration (`internal/serving/manager.go:69-70`). A remote engine therefore has to be reached over unauthenticated HTTP on TCP. That is root on the remote host for anyone on the path, and nothing warns the operator.\n\n## Proposal\n- Support `DOCKER_TLS_CA_FILE`, `DOCKER_TLS_CERT_FILE` and `DOCKER_TLS_KEY_FILE` (the same semantics as `DOCKER_CERT_PATH`) with `https://` base URLs.\n- Refuse `http://` for non-loopback hosts unless `DOCKER_ALLOW_INSECURE=true` is set.\n\n## Acceptance criteria\n- [ ] Test using `httptest.NewTLSServer` with client-cert verification: a request without the cert fails and a request with it succeeds.\n- [ ] Test: `http://10.0.0.5:2375` is rejected at startup without the opt-in.\n- [ ] README configuration table updated."
+  },
+  {
+    "title": "Reconcile containers on startup: adopt matching ones and remove orphans",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:manager"
+    ],
+    "body": "## Problem\nThe manager keeps no desired state and does no reconciliation at startup (`cmd/serving-manager/main.go:19-40`). `List` only reflects whatever labeled containers exist (`internal/serving/manager.go:259-280`). Two kinds of leftover survive:\n- Containers for deployments deleted in the platform while the manager was down keep running because of `unless-stopped` (`manager.go:230`).\n- Containers left in `created` state by a failed start (`manager.go:242`) are never removed.\n\nThe platform also cannot detect drift, where the recorded artifact differs from the running container.\n\n## Proposal\n- Add a `mlaiops.spec-hash` label (hash of artifact, image, runtime and resources).\n- On startup and on an interval, fetch desired deployments from the gateway (internal endpoint).\n- Diff the desired list against labeled containers. Adopt containers whose hash matches, recreate ones that drifted, and remove orphans plus `created` or `exited` leftovers older than a grace period.\n- Expose `POST /reconcile` and a dry-run mode.\n\n## Acceptance criteria\n- [ ] Test with a fake engine holding 3 containers (1 desired and matching, 1 orphan, 1 stale `created`): reconcile keeps 1 and removes 2.\n- [ ] Test: a hash mismatch triggers a redeploy.\n- [ ] Dry-run returns the plan and makes no engine mutations.\n- [ ] Reconcile actions are logged and counted in metrics."
+  },
+  {
+    "title": "Add an inference router that enforces canary traffic weights",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:router"
+    ],
+    "body": "## Problem\nThe platform stores a canary weight, but nothing enforces it. Container identity is the model name alone (`containerName(name)`, `internal/serving/manager.go:239,245`), and `Deploy` replaces any existing container (`manager.go:181-184,211`). Two versions of one model therefore cannot run at the same time. Clients call the container directly, so there is no hop where traffic could be split.\n\n## Proposal\n- Make container identity `name + revision` (labels `mlaiops.revision` and `mlaiops.role=stable|canary`).\n- Add `internal/router`: an `httputil.ReverseProxy` keyed by model name. It picks the backend by weighted random choice, with optional stickiness on a header such as `X-Kionga-Session`.\n- Add `PUT /deployments/{name}/traffic {\"stable\": 90, \"canary\": 10}`, applied atomically.\n- Mirror KServe `canaryTrafficPercent` semantics.\n\n## Acceptance criteria\n- [ ] Test: 10,000 routed requests at a 10% weight land 10% plus or minus 1.5% on the canary.\n- [ ] Test: a sticky header always maps to the same revision.\n- [ ] Test: a weight change takes effect without dropping in-flight requests.\n- [ ] Responses include an `X-Kionga-Revision` header."
+  },
+  {
+    "title": "Mirror shadow traffic to a candidate revision without affecting responses",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:router"
+    ],
+    "body": "## Problem\nThe only way to test a new version today is to replace the live one (`internal/serving/manager.go:211`). There is no way to send real traffic to a candidate and compare it without users seeing the candidate's responses.\n\n## Proposal\n- In the router (see the canary router issue), add `shadow: {revision, percent}` per model.\n- Copy the request body (up to the configured limit), send it asynchronously to the shadow, and discard the response. Record latency, status and an optional output diff in metrics.\n- Bound shadow concurrency with a semaphore and drop excess requests, so the shadow never slows the primary.\n\n## Acceptance criteria\n- [ ] Test: the client gets the primary's response even when the shadow returns 500 or hangs.\n- [ ] Test: primary p99 latency does not change when the shadow sleeps 5s (using a fake backend).\n- [ ] Shadow requests are counted in `kionga_serving_shadow_requests_total{model,code}`.\n- [ ] Excess shadow requests are dropped and counted, never queued without limit."
+  },
+  {
+    "title": "Run multiple replicas per model revision behind the router",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:autoscaling"
+    ],
+    "body": "## Problem\nEach deployment is exactly one container (`internal/serving/manager.go:239-245`). The request has no replica field (`cmd/serving-manager/main.go:61-65`). A single gunicorn process group is a single point of failure, and throughput is capped by one container.\n\n## Proposal\n- Add `replicas` (default 1, max from `SERVE_MAX_REPLICAS`) to the deploy request.\n- Name containers `<name>-<rev>-r<n>` with an `mlaiops.replica` label.\n- Have the router balance across ready replicas by least outstanding requests and eject replicas that fail health checks.\n- `List` aggregates replicas per revision as `ready/desired`.\n\n## Acceptance criteria\n- [ ] Test: `replicas: 3` creates three containers with distinct names and shared revision labels.\n- [ ] Router test: killing one fake backend shifts all traffic to the other two with no 5xx after ejection.\n- [ ] `GET /deployments` shows `ready_replicas` and `replicas`.\n- [ ] Scaling 3 to 1 drains removed replicas before they stop."
+  },
+  {
+    "title": "Autoscale replicas on in-flight requests and latency",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:autoscaling"
+    ],
+    "body": "## Problem\nNo component measures load or changes capacity. The manager only creates and deletes containers on request (`internal/serving/manager.go:185-256`), so traffic spikes queue inside a single gunicorn process.\n\n## Proposal\n- Add `internal/autoscaler`, modeled on the Knative KPA used by KServe.\n- Target concurrency per replica (`autoscaling.target`), with stable (60s) and panic (6s) windows, `minReplicas`/`maxReplicas`, and scale-down cooldown.\n- Read signals from router in-flight counters, with an optional p95 latency target.\n- Apply decisions through the replica API, and expose current and desired counts.\n\n## Acceptance criteria\n- [ ] Unit test with a fake clock and synthetic load: concurrency 30 at target 10 scales to 3 within the panic window.\n- [ ] Test: load drops to 0 and scale-down waits for the cooldown and never goes below `minReplicas`.\n- [ ] Test: flapping load near the threshold changes replicas no more than once per stable window.\n- [ ] Decisions are logged and exported as `kionga_serving_desired_replicas`."
+  },
+  {
+    "title": "Scale idle models to zero and buffer requests during cold start",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:autoscaling"
+    ],
+    "body": "## Problem\nEvery deployed model keeps a container running forever (`RestartPolicy: unless-stopped`, `internal/serving/manager.go:230`). On a single host, rarely used models hold memory and GPUs indefinitely, and nothing reactivates a stopped one.\n\n## Proposal\n- Allow `minReplicas: 0` with `scaleToZeroAfter` (default 15m idle).\n- Stop the container (`POST /containers/{id}/stop`) but keep it and its artifact cache, so restart skips the download.\n- The router acts as the activator. It holds requests in a bounded per-model queue, starts the container, waits for readiness and flushes the queue. If `coldStartTimeout` passes, it returns 503 with `Retry-After`.\n- Match KServe `minReplicas: 0` behavior.\n\n## Acceptance criteria\n- [ ] Test: after the idle period, the fake engine receives a stop call and the deployment shows `scaled_to_zero`.\n- [ ] Test: a request to a zero-scaled model triggers start and returns 200 once the fake reports ready.\n- [ ] Test: when the queue is full or the timeout passes, the router returns 503 with `Retry-After`.\n- [ ] Cold-start duration is recorded in a histogram."
+  },
+  {
+    "title": "Add resource profiles for CPU, memory and GPU selection",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:runtimes"
+    ],
+    "body": "## Problem\n`HostConfig` sets no `Memory`, `NanoCpus`, `ShmSize` or `DeviceRequests` (`internal/serving/manager.go:228-234`), and the deploy request has no resource field (`cmd/serving-manager/main.go:61-65`). One model can exhaust host memory and take down the manager and the rest of the platform. GPU models cannot be served at all.\n\n## Proposal\n- Define named profiles in config (for example `cpu-small: 1 CPU/2Gi`, `gpu-a10-1: 4 CPU/16Gi/1 GPU`) and add a `profile` request field.\n- Translate a profile into `Memory`, `MemorySwap` (equal to `Memory`), `NanoCpus`, `ShmSize` and `DeviceRequests: [{Driver: nvidia, Count: n, Capabilities: [[gpu]]}]`.\n- Apply a default profile when none is given.\n- Track GPU assignment per device ID to avoid oversubscription.\n- Use the same profile names as KServe `resources` for parity.\n\n## Acceptance criteria\n- [ ] Test: the default deploy carries a non-zero `Memory` and `NanoCpus`.\n- [ ] Test: a GPU profile adds `DeviceRequests`, and an unknown profile returns 400.\n- [ ] Test: a second deploy requesting an already-assigned GPU fails with 409 when no device is free.\n- [ ] README lists the profiles and how to define new ones."
+  },
+  {
+    "title": "Introduce a runtime interface so MLflow, vLLM and llama.cpp share one contract",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:runtimes"
+    ],
+    "body": "## Problem\nThe container command is hardcoded to `mlflow models serve` (`internal/serving/manager.go:214-220`). The port is fixed at 5001 for every model (`manager.go:62`). LLM runtimes need different commands, ports, health paths and protocols, so they cannot be deployed today without a custom image that pretends to be MLflow.\n\n## Proposal\n- Define a `Runtime` interface: `Command(spec) []string`, `Port() int`, `HealthPath() string`, `Protocol() (\"v2\" | \"openai\")`, `DefaultImage()`.\n- Implement `mlflow`, `vllm` (`vllm serve <model> --port`, `/health`, OpenAI API) and `llamacpp` (`llama-server -m`, `/health`).\n- Add a `runtime` field to the request and record it in a label.\n- The router exposes Open Inference Protocol v2 for predictive models and `/v1/chat/completions` for LLMs, mirroring KServe `ServingRuntime`.\n\n## Acceptance criteria\n- [ ] Table test: each runtime produces the expected `Cmd`, exposed port and `Healthcheck`.\n- [ ] An unknown runtime returns 400.\n- [ ] Integration test (optional job) runs llama.cpp with a tiny GGUF model and gets a completion through the router.\n- [ ] Existing deploys without `runtime` keep the MLflow behavior (regression test)."
+  },
+  {
+    "title": "Cache model artifacts on the host across restarts and redeploys",
+    "labels": [
+      "performance",
+      "P2",
+      "area:runtimes"
+    ],
+    "body": "## Problem\nEvery container start downloads the artifact inside `mlflow models serve -m <uri>` (`internal/serving/manager.go:216`). No volume is mounted. Each crash restart under `unless-stopped` (`manager.go:230`), each redeploy and each rollback downloads the full model again. This slows cold starts and is the reason containers need store credentials (`cmd/serving-manager/main.go:24-28`).\n\n## Proposal\n- Add a storage initializer in the manager (KServe parity). Resolve `models:/name/version` to its source URI and download once into a content-addressed directory under `SERVE_MODEL_CACHE` (keyed by resolved URI plus checksum).\n- Mount the directory read-only at `/mnt/models` and pass `-m /mnt/models`.\n- Add LRU eviction under a size cap. Never evict entries in use by a running container.\n\n## Acceptance criteria\n- [ ] Test: deploying the same artifact twice triggers one fetch, and the second create payload has the same bind mount.\n- [ ] Test: when the cache is over its cap, the least recently used unused entry is evicted and in-use entries remain.\n- [ ] A checksum mismatch fails the deploy.\n- [ ] Measured cold start for a cached model is documented in the PR."
+  },
+  {
+    "title": "Enforce auth, body size, timeouts and concurrency limits on inference requests",
+    "labels": [
+      "security",
+      "P2",
+      "area:router"
+    ],
+    "body": "## Problem\nModel endpoints are plain `http://mlaiops-serve-<name>:5001` (`internal/serving/manager.go:245`) and have no authentication. Any container on the shared network can call them (`manager.go:229`). The manager sets no request body limit, per-request timeout or concurrency cap, so one large or slow request can tie up every gunicorn worker.\n\n## Proposal\nIn the router:\n- Verify a per-model bearer token or gateway-signed JWT.\n- Apply `http.MaxBytesReader` (default 10 MiB, set per model) and a per-request timeout (default 60s, longer for LLM streaming).\n- Cap per-model concurrency, returning 429 with `Retry-After`.\n- Rate-limit per caller with a token bucket.\n\nModel containers are reachable only from the router (see the network isolation issue).\n\n## Acceptance criteria\n- [ ] Router test: no token returns 401, a body over the limit returns 413, and a backend slower than the timeout returns 504.\n- [ ] Test: above the concurrency cap the router returns 429 and the backend never sees the excess requests.\n- [ ] Limits can be configured per model and appear in `GET /deployments/{name}`."
+  },
+  {
+    "title": "Expose Prometheus metrics for inference traffic and Docker operations",
+    "labels": [
+      "observability",
+      "P2",
+      "area:observability"
+    ],
+    "body": "## Problem\nThe mux registers only `/healthz` and `/deployments` (`cmd/serving-manager/main.go:40-89`). The only log line is printed at startup (`main.go:92`). There is no RPS, latency, error rate, deploy outcome, engine latency or restart count, so no SLO can be measured and the autoscaler has no signals.\n\n## Proposal\nAdd `GET /metrics` with `prometheus/client_golang`:\n- `kionga_serving_requests_total{model,revision,code}`\n- `kionga_serving_request_duration_seconds` histogram\n- `kionga_serving_inflight_requests{model,revision}`\n- `kionga_serving_deploys_total{result}`\n- `kionga_docker_api_duration_seconds{op,status}`\n- `kionga_serving_container_restarts{model}`, taken from `RestartCount` via inspect\n\nKeep label cardinality bounded to known models.\n\n## Acceptance criteria\n- [ ] Test: after one deploy and one failed deploy against the fake engine, `/metrics` shows `deploys_total{result=\"success\"} 1` and `{result=\"error\"} 1`.\n- [ ] Router test: request counter and histogram increment with the correct `code` label.\n- [ ] `/metrics` requires the internal token or a separate listener (`METRICS_ADDR`).\n- [ ] An example Grafana dashboard JSON is committed under `docs/`."
+  },
+  {
+    "title": "Emit structured logs with request IDs and a deploy audit trail",
+    "labels": [
+      "observability",
+      "P3",
+      "area:manager"
+    ],
+    "body": "## Problem\nThe service uses `log.Printf` only (`cmd/serving-manager/main.go:92,121`). Nothing is logged for deploys, undeploys, auth failures or engine errors. When a model goes down, there is no record of who replaced it, with which artifact and image, or what Docker returned. Errors go only to the HTTP caller (`main.go:51,74,85`).\n\n## Proposal\n- Switch to `log/slog` with a JSON handler.\n- Add middleware that accepts or generates `X-Request-ID`, logs method, path, status and duration, and passes the ID through context to engine calls.\n- Emit an audit event per mutation: action, name, artifact, image digest, caller, result.\n- Add `GET /deployments/{name}/logs?tail=N`, which proxies container logs to the platform with a size cap.\n\n## Acceptance criteria\n- [ ] Test captures slog output and asserts that a deploy logs one audit record with all fields and the request ID.\n- [ ] Test: a 401 logs an auth failure without the token value.\n- [ ] Test: the logs endpoint caps output at N lines and 1 MiB."
+  },
+  {
+    "title": "Add rollback to the previous revision, automatic when a rollout fails",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:manager"
+    ],
+    "body": "## Problem\nThe `Deploy` comment says replacing an existing deployment \"makes rollback and re-deploy idempotent\" (`internal/serving/manager.go:181-184`). In fact the old container is deleted before the new one starts (`manager.go:211`), and its artifact and image are not kept anywhere. To roll back, the caller has to remember and resend the previous spec, and the rollback itself has the same downtime window.\n\n## Proposal\n- Keep the last N revisions as stopped containers or recorded specs (labels or a small state file).\n- Add `POST /deployments/{name}/rollback` (optional `revision`), which reuses the zero-downtime replace path.\n- Roll back automatically when a new revision fails readiness, or when its canary error rate exceeds a threshold during the rollout window (router metrics).\n\n## Acceptance criteria\n- [ ] Test: deploy rev1, deploy rev2, rollback. Rev1's artifact and image serve again with no window where neither container exists.\n- [ ] Test: rev2 failing readiness leaves rev1 serving and records `rolled_back` state.\n- [ ] Test: canary error rate above the threshold sets the canary weight to 0 and emits an audit event.\n- [ ] Rollback with no previous revision returns 409."
+  },
+  {
+    "title": "Report real health, revision and replica state in the deployments API",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\n`List` returns only the raw Docker `State` and an endpoint derived from the name, even for exited containers (`internal/serving/manager.go:262-277`). There is no health status, restart count, revision, error or start time, and no `GET /deployments/{name}`. `/healthz` returns ok without checking whether the Docker engine is reachable (`cmd/serving-manager/main.go:41-43`), so orchestrators keep sending traffic to a manager that cannot do anything.\n\n## Proposal\n- Extend `Deployment` with `health` (from `State.Health`), `restart_count`, `revision`, `started_at`, `last_error` and `ready_replicas`.\n- Add `GET /deployments/{name}` (404 when absent).\n- Keep `/healthz` as liveness only. Add `/readyz`, which pings `GET /_ping` on the engine with a 2s timeout.\n- Omit `endpoint`, or mark it unusable, when no replica is ready.\n\n## Acceptance criteria\n- [ ] Test: a fake container with `Health.Status=unhealthy` and `RestartCount=4` is reported with those values.\n- [ ] Test: `GET /deployments/ghost` returns 404.\n- [ ] Test: `/readyz` returns 503 when the fake engine is down, and `/healthz` stays 200.\n- [ ] OpenAPI spec updated."
+  },
+  {
+    "title": "Shut down gracefully and drain model containers before removal",
+    "labels": [
+      "reliability",
+      "P3",
+      "area:manager"
+    ],
+    "body": "## Problem\n`log.Fatal(server.ListenAndServe())` (`cmd/serving-manager/main.go:93`) does not handle SIGTERM. A restart of the manager cuts off in-flight deploys, possibly between the delete at `internal/serving/manager.go:211` and the create at `manager.go:239`. `Undeploy` uses `DELETE ...?force=true` (`manager.go:251`), which SIGKILLs the model while requests are in flight.\n\n## Proposal\n- Handle SIGINT and SIGTERM with `signal.NotifyContext`, call `server.Shutdown` with a 30s budget, and let in-flight engine operations finish.\n- In `Undeploy`, remove the replica from the router first. Then call `POST /containers/{id}/stop?t=<grace>` (default 30s), then delete without force, falling back to force on timeout.\n\n## Acceptance criteria\n- [ ] Test: Undeploy issues stop with `t=30` before delete.\n- [ ] Test: SIGTERM during a slow fake deploy lets the deploy complete before the process exits.\n- [ ] Router test: a draining replica gets no new requests and its in-flight requests complete."
+  },
+  {
+    "title": "Publish an OpenAPI spec for the serving-manager API with a contract test",
+    "labels": [
+      "docs",
+      "P3",
+      "area:api"
+    ],
+    "body": "## Problem\nThe API is documented only as a four-row table (`README.md:15-20`). Request fields (`cmd/serving-manager/main.go:61-65`), response shapes (`main.go:54,77`), error bodies and status codes (`main.go:46,51,69,74,85`) are undocumented. The platform gateway and any third-party client have to read Go source to integrate, and nothing catches drift.\n\n## Proposal\n- Add `api/openapi.yaml` (3.1) covering all routes, schemas and error codes, plus the planned traffic, rollback and replica endpoints as they land.\n- Version the routes under `/v1` and keep the unprefixed routes as aliases for one release.\n- Add a Go test that loads the spec and checks every registered route and response against it (for example with `kin-openapi`).\n\n## Acceptance criteria\n- [ ] `api/openapi.yaml` validates in CI.\n- [ ] Contract test fails when a handler returns a status code that is not in the spec.\n- [ ] The README links the spec and drops the hand-written table."
+  },
+  {
+    "title": "Extract HTTP handlers from main and add handler tests",
+    "labels": [
+      "testing",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nAll handlers are closures inside `main()` (`cmd/serving-manager/main.go:40-89`) and read env vars directly (`main.go:97`). There is no `main_test.go`. Auth, `DisallowUnknownFields` decoding (`main.go:66-67`), the 1 MiB body limit and status code mapping are untested. CI (`.github/workflows/ci.yml`) cannot catch regressions in any of them.\n\n## Proposal\n- Move the routes into `internal/api.NewHandler(deployer Deployer, token string) http.Handler`, where `Deployer` is an interface implemented by `*serving.Manager`.\n- `main` only wires config.\n- Add table tests with `httptest` and a fake `Deployer`.\n\n## Acceptance criteria\n- [ ] Tests cover: 401 without token, 400 on unknown JSON field, 413 or 400 on bodies over 1 MiB, 201 on success, 204 on delete, and 502/503 when the deployer fails.\n- [ ] `go test -race ./...` covers `internal/api`.\n- [ ] `main.go` is under 60 lines and has no handler logic."
+  },
+  {
+    "title": "Build a stateful fake Docker engine and add real Docker integration tests",
+    "labels": [
+      "testing",
+      "P2",
+      "area:manager"
+    ],
+    "body": "## Problem\n`fakeDocker` (`internal/serving/manager_test.go:13-44`) always answers DELETE with 404, always returns `ctr-1`, keeps no container state and cannot inject failures. That is why the swallowed 404 on create (`internal/serving/manager.go:112`) and the leak on failed start (`manager.go:242`) go undetected. The fake also hardcodes test expectations in the handler (`manager_test.go:25-30`). No test runs against a real engine, so payload fields that Docker rejects are never caught.\n\n## Proposal\n- Add `internal/dockertest`: an in-memory engine with containers keyed by name and ID, states, health transitions, and per-route failure injection (status, delay).\n- Add `//go:build integration` tests that use the real socket with a tiny image (for example an HTTP echo serving `/ping`). Run them via `make integration` and a CI job on `ubuntu-latest`.\n\n## Acceptance criteria\n- [ ] Existing manager tests are ported to the stateful fake.\n- [ ] New tests cover create 404, start 500, delete 500 and a slow engine.\n- [ ] The integration job deploys, lists, redeploys and undeploys a real container and leaves no labeled containers behind.\n- [ ] `make integration` is documented in the README."
+  },
+  {
+    "title": "Define one deployment spec that renders to both Docker and a KServe InferenceService",
+    "labels": [
+      "enhancement",
+      "P3",
+      "area:runtimes"
+    ],
+    "body": "## Problem\nThe package doc says KServe is the Kubernetes path (`internal/serving/manager.go:2-4`, `README.md:37-38`). However, the Docker path takes only `name`, `artifact_uri` and `serving_image` (`cmd/serving-manager/main.go:61-65`), with no shared model of runtime, resources, replicas, canary or limits. As features land here they will drift from KServe, and users moving from Compose to Kubernetes will get different behavior.\n\n## Proposal\n- Add `internal/spec.DeploymentSpec` (runtime, storageUri, resources profile, min and max replicas, scale target, canaryTrafficPercent, timeouts) and use it as the deploy request body.\n- Add `spec.ToInferenceService()`, which renders `serving.kserve.io/v1beta1` YAML.\n- Write a backend-neutral conformance suite (deploy, traffic split, scale to zero, rollback) that runs against the Docker backend and, in an optional job, against kind with KServe.\n\n## Acceptance criteria\n- [ ] Golden-file tests: three specs (MLflow CPU, vLLM GPU, canary at 20%) render the expected InferenceService YAML.\n- [ ] The Docker backend consumes the same spec. Existing request fields map onto it without breaking changes (test).\n- [ ] The conformance suite passes on Docker in CI.\n- [ ] A parity table goes in `docs/kserve-parity.md`."
+  },
+  {
+    "title": "Fix the EXPOSE port mismatch and add an operator guide",
+    "labels": [
+      "docs",
+      "P3",
+      "area:docs"
+    ],
+    "body": "## Problem\nThe image declares `EXPOSE 8080` (`Dockerfile:14`), but the service listens on `PORT` with default `8085` (`cmd/serving-manager/main.go:91`, `README.md:29`). Tooling that trusts `EXPOSE` points at the wrong port. The README does not say:\n- what a custom `serving_image` must contain (MLflow CLI, framework dependencies, port 5001, a health path)\n- which hardening controls apply (`internal/serving/manager.go:228-234`)\n- how to troubleshoot a failed deploy\n- that model containers receive the S3 credentials (`main.go:24-28`)\n\n## Proposal\n- Change `EXPOSE` to 8085.\n- Add `docs/operations.md`: serving image contract, security posture and threat model, configuration reference, troubleshooting (logs, inspect, common 4xx and 5xx), and how to upgrade the Docker API version safely.\n\n## Acceptance criteria\n- [ ] `docker inspect ghcr.io/kiongahq/serving-manager:dev` shows 8085 as the exposed port.\n- [ ] `docs/operations.md` exists and is linked from the README.\n- [ ] A CI check (`grep` or a small test) fails when the `EXPOSE` port differs from the default `PORT`."
+  }
+]

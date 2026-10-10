@@ -1,0 +1,380 @@
+[
+  {
+    "title": "Reject cross-origin state-changing requests from same-site workspace hosts",
+    "labels": [
+      "security",
+      "P1",
+      "area:api"
+    ],
+    "body": "## Problem\nThe workspaces that users control share a registrable site with the console. `go/internal/runtimeconfig/config.go:103-107` requires this. Because of that, the browser treats requests from a notebook on a workspace subdomain as same-site:\n- The console session cookies are `SameSite=Lax` (`go/internal/auth/session.go:132,139` and `go/internal/auth/local_session.go:120`, line numbers at d1e239c).\n- The editorial cookie is `SameSite=Strict` (`go/internal/httpapi/editorial.go:156`).\n- The browser still sends all of these cookies on same-site subresource requests.\n\nNothing on the server blocks a forged write:\n- `decode` (`go/internal/httpapi/server.go:1566-1570`) parses JSON whatever the `Content-Type` is. A `fetch(..., {method:\"POST\", credentials:\"include\", body:'{...}'})` with the default `text/plain` type is a CORS simple request, so no preflight runs.\n- `cors` (`server.go:1585-1602`) only sets response headers. It never rejects a request.\n- The editorial guard only blocks `Sec-Fetch-Site == \"cross-site\"` (`editorial.go:129`). A same-site workspace origin gets through.\n\nResult: JavaScript in any workspace can submit pipelines, mint API tokens (`POST /api/v1/settings/tokens`) or publish posts as any console user who opens it.\n\n## Proposal\n- Add a middleware in `httpapi.New` for unsafe methods (POST, PUT, PATCH, DELETE). It allows the request only when one of these holds:\n  - `Sec-Fetch-Site` is `same-origin`.\n  - `Origin` equals `MLAIOPS_ALLOWED_ORIGIN`.\n  - The request carries no cookie credentials (bearer token or API token only).\n- Make `decode` require `Content-Type: application/json` and return 415 otherwise. Keep the multipart upload at `/api/v1/editorial/media` behind the Origin check only.\n- Change the editorial guard to the same rule (`same-origin` or the allowed Origin), not just \"not cross-site\".\n\n## Acceptance criteria\n- [ ] A cookie-authenticated POST with `Origin: https://ws-x.example.com` or `Sec-Fetch-Site: same-site` gets 403 on `/api/v1/pipelines/submit` and `/api/v1/editorial/posts`.\n- [ ] A `text/plain` JSON body gets 415 from every handler that uses `decode`.\n- [ ] Bearer and `nxs_` token clients without Origin headers still work (CLI test unchanged).\n- [ ] A new httptest table test in `go/internal/httpapi` covers the same-origin, same-site, cross-site and no-Origin cases."
+  },
+  {
+    "title": "Revoke or re-check API tokens when the owner is suspended or loses access",
+    "labels": [
+      "security",
+      "P1",
+      "area:auth"
+    ],
+    "body": "## Problem\nA token keeps its original reach after an admin removes access from its owner:\n- `APITokenMiddleware` builds the principal only from the stored token: `Roles: [user]`, plus the token's own `Services` and `ProjectIDs` (`go/internal/auth/token.go:27-30`).\n- `RBACWithResolver` skips the access resolver whenever `principal.Credential == \"api_token\"` (`go/internal/auth/auth.go:183` at d1e239c). So `Disabled`, role changes and project removals made by an admin are never applied to token requests.\n- `allowedProjectIDs` returns the scopes frozen into the token (`go/internal/httpapi/access.go:60-62`).\n- `tokenScopesAllowed` runs only at creation (`server.go:286-304`).\n- Neither `UpsertUserAccess` with `Disabled: true` nor `DeleteUserAccess` revokes tokens. `RevokedAt` is only set in `RevokeAPIToken` (`go/internal/store/postgres.go:199-201`).\n\nResult: a suspended or offboarded user's `nxs_` token keeps working for up to 365 days.\n\n## Proposal\n- In `RBACWithResolver`, resolve the token owner's current `UserAccess` too. Then apply two rules:\n  - Deny when the owner is disabled or missing.\n  - Use the intersection of the token's scopes and the owner's current services and projects.\n- Also revoke all of a subject's tokens inside the same transaction as `DeleteUserAccess`, and on suspension (defense in depth). Write an `api_token.revoked` audit event for each.\n\n## Acceptance criteria\n- [ ] Once the owner is suspended, a request with their existing token returns 403.\n- [ ] Removing project P from the owner makes token requests for P return 404/403, even though the token listed P.\n- [ ] `DeleteUserAccess` marks every token of that subject revoked, in both the file and Postgres stores (storetest conformance case).\n- [ ] A regression test in `go/internal/httpapi/access_test.go` covers the suspend-then-use flow."
+  },
+  {
+    "title": "Stop Kubernetes Jobs and function nodes when a pipeline run is cancelled",
+    "labels": [
+      "bug",
+      "P1",
+      "area:pipelines"
+    ],
+    "body": "## Problem\n`cancelRun` (`go/internal/httpapi/server.go:516-531`) changes the stored status and only notifies Prefect when an `EngineRunID` exists. The other two engines are never told:\n- The Kubernetes executor starts with `context.Background()` (`go/internal/httpapi/k8s_dispatch.go:89`), so nothing can cancel it.\n- The OpenFaaS path does the same (`go/internal/httpapi/pipeline_dispatch.go:134`).\n\nAfter cancel:\n- `execution.Run` keeps scheduling downstream nodes.\n- `Executor.wait` keeps polling (`go/internal/k8sexec/executor.go:248-282`).\n- GPU and CPU Jobs run to completion.\n- `applyStepTransition` freezes the run at `cancelled` (`go/internal/store/store.go:446`) while steps keep changing underneath it.\n\n`enforceRunQuota` only counts `queued`/`running` runs (`go/internal/httpapi/access.go:500-503`). A user can therefore cancel and resubmit to get past the concurrency quota while the old Jobs are still running.\n\n## Proposal\n- Keep a `map[runID]context.CancelFunc` in the Server for in-process executions. Create each executor context with `context.WithCancel` and call the cancel func from `cancelRun`.\n- When the executor's context is cancelled, have it delete the active Jobs with `PropagationPolicy=Background` (today it uses `context.Background()` inside `wait`) and report the remaining nodes as `skipped`.\n- For runs owned by another replica, the executor polls the run status between nodes and stops on `cancelled`.\n\n## Acceptance criteria\n- [ ] With the fake clientset in `executor_test.go`, cancelling during node 1 deletes its Job and never creates the Job for node 2.\n- [ ] A functions-mode run stops invoking functions after cancel.\n- [ ] A step report that arrives after cancel does not change run status and is logged as post-cancel.\n- [ ] An httpapi test shows the quota is not freed until the cancelled run's workloads have stopped."
+  },
+  {
+    "title": "Recover in-flight Kubernetes and function runs after a gateway restart",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:pipelines"
+    ],
+    "body": "## Problem\nThe Kubernetes executor and the function-pipeline executor run as goroutines inside the gateway process (`go/internal/httpapi/k8s_dispatch.go:89`, `go/internal/httpapi/pipeline_dispatch.go:134`). Nothing persists their progress apart from step reports, and no startup path resumes them.\n\nA rollout, OOM or crash mid-run does this:\n- The run stays `running` forever.\n- Its Jobs finish unobserved, and downstream nodes never start.\n- The stuck run keeps holding a slot in `enforceRunQuota` (`go/internal/httpapi/access.go:491-509`).\n\nNo code searches for orphaned `running` runs.\n\n## Proposal\n- Record an executor lease on the run (holder plus `heartbeat_at`), renewed by the goroutine.\n- At startup and on an interval, a reconciler (leader-elected like `scheduler.acquireLease`) finds runs with expired leases. For Kubernetes runs it adopts the existing Jobs by their deterministic name (`k8sexec.JobName`) and continues the DAG, or marks the run `failed` with a reason when adoption is not possible.\n- Document the guarantee in the k8sexec package comment.\n\n## Acceptance criteria\n- [ ] A test calls `Executor.Run`, cancels it partway to simulate a crash, starts the reconciler, and shows the run completes or fails with an explicit message. It must not stay `running`.\n- [ ] The reconciler is a no-op on replicas that do not hold the lease.\n- [ ] The run detail shows `recovered by <holder>` in the platform log source.\n- [ ] Orphaned runs no longer count against the concurrent-run quota after the lease expires."
+  },
+  {
+    "title": "Stop the file store overwriting an unreadable data file with demo seed data",
+    "labels": [
+      "bug",
+      "P1",
+      "area:store"
+    ],
+    "body": "## Problem\n`store.New` ignores the error from `load()` (`go/internal/store/store.go:109`):\n- If `platform.json` exists but is truncated, corrupt or unreadable (permissions), `s.data` stays empty.\n- The `len(s.data.Projects) == 0` branch then seeds `prj-demo` and calls `persist()` (`store.go:111-116`), which atomically replaces the user's file.\n- All projects, runs, tokens, IAM policies and audit history are lost with no log line.\n\nTwo more weaknesses:\n- `persist` (`store.go:789-805`) writes the temp file and renames it without `fsync`, so a power loss can leave a zero-length file. That then triggers the overwrite above on the next boot.\n- `go/cmd/gateway/main.go:78` uses this store whenever `DATABASE_URL` is unset.\n\n## Proposal\n- Change `New` to return `(*Store, error)`. On a load error other than `ErrNotExist`, fail startup and leave the file alone.\n- Seed only when the file did not exist.\n- In `persist`, fsync the temp file and the directory before and after the rename. Keep a single `.bak` of the previous version.\n\n## Acceptance criteria\n- [ ] A test writes `{\"projects\": [` to the data path; `New` returns an error and the file bytes are unchanged.\n- [ ] A missing file still seeds the demo project.\n- [ ] The gateway exits non-zero with a clear message when the data file cannot be parsed.\n- [ ] `persist` calls `File.Sync` (asserted via a small fs abstraction or code review checklist)."
+  },
+  {
+    "title": "Make storage-proxy fail closed without an internal token and compare it in constant time",
+    "labels": [
+      "security",
+      "P2",
+      "area:storage"
+    ],
+    "body": "## Problem\nThe storage proxy holds the S3 credentials (`go/cmd/storage-proxy/main.go:18`). It has two auth weaknesses:\n- `authorized()` returns true when `MLAIOPS_INTERNAL_TOKEN` is empty (`main.go:84-87`). The `/presign` handler uses the same rule (`main.go:61`). If that secret is missing, anything that can reach port 8084 can list every bucket, read objects and mint presigned URLs.\n- Both checks use `==` string comparison, not `subtle.ConstantTimeCompare` as the gateway does.\n\nThe gateway refuses to start without the token in production (`go/internal/runtimeconfig/config.go:83`), but the storage proxy never calls a validator. Error bodies also return raw upstream errors (`main.go:31,43,55`), which can include the S3 endpoint and request details.\n\n## Proposal\n- Add `runtimeconfig.ValidateStorageProxy()`: require the token always, unless `KIONGA_ENVIRONMENT=development` is set explicitly.\n- Move the auth check into a single middleware using constant-time comparison.\n- Return generic `upstream_error` messages and log the details.\n\n## Acceptance criteria\n- [ ] With no token set and no development flag, the process exits at startup.\n- [ ] Requests with a missing or wrong bearer get 401 on `/buckets`, `/objects`, `/object` and `/presign`.\n- [ ] New `go/cmd/storage-proxy/main_test.go` covers both cases (the package has no tests today).\n- [ ] Responses no longer include the raw S3 error text."
+  },
+  {
+    "title": "Apply bucket assignments and IAM policy to storage access for every role",
+    "labels": [
+      "security",
+      "P2",
+      "area:iam"
+    ],
+    "body": "## Problem\nStorage access is checked differently from everything else:\n- `storageAllowed` returns true for every principal that is not `user`, including project-scoped `viewer` and `engineer` principals (`go/internal/httpapi/access.go:540-543`). They can list and preview objects in every bucket through `/api/v1/storage/object`.\n- For `user` principals an empty `bucket` query is allowed (`access.go:548-550`).\n- Bucket filtering of `/buckets` applies only to `RoleUser` (`go/internal/httpapi/server.go:717`).\n- The policy catalog has no storage action (`go/internal/policy/policy.go:353-372`), so an attached explicit-deny policy cannot restrict storage. All other sensitive surfaces go through `s.authorize`.\n\n## Proposal\n- Add `storage:List` and `storage:Read` actions with a `kionga:storage/<bucket>/<prefix>` resource to `policy`.\n- Change the role baselines (`policy/baseline.go`) so viewers and engineers get storage access only for buckets bound to their projects or their access profile.\n- Replace `storageAllowed` with `s.authorize`. Reject an empty bucket on `/objects` and `/object`.\n\n## Acceptance criteria\n- [ ] A viewer scoped to project A gets 403 reading an object in a bucket not assigned to A.\n- [ ] An explicit-deny policy on `storage:Read` blocks an admin-granted engineer (test in `iam_test.go`).\n- [ ] `/api/v1/iam/explain` reports storage decisions.\n- [ ] `GET /api/v1/storage/object` without `bucket` returns 400."
+  },
+  {
+    "title": "Scope the audit log to the caller's projects and stop exposing it to project-scoped roles",
+    "labels": [
+      "security",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\n`GET /api/v1/audit` returns the latest 500 tenant-wide events with no filtering (`go/internal/httpapi/server.go:1533-1536`, `go/internal/store/postgres.go:311-312`).\n\n`auth.Allowed` lets any `viewer` or `engineer` read it, because GET is allowed for those roles (`go/internal/auth/auth.go` `Allowed`, `RoleViewer` and `RoleEngineer` cases). Those principals can be limited to specific projects (`go/internal/httpapi/access.go:41-50`), yet the audit feed shows:\n- actor emails\n- `access.*` changes for other users\n- resource IDs from every project\n\nThat breaks the project isolation that `/api/v1/projects` and `/api/v1/logs` enforce.\n\n## Proposal\n- Add `project_id` to audit events. It is derivable for project, run, model, agent and definition writes in `writeTx`.\n- Filter with `allowedProjectIDs` for scoped principals.\n- Return tenant-level events (`access.*`, `iam.*`, `connection.*`) only to admin and operator, or put them behind a new `audit:Read` policy action.\n\n## Acceptance criteria\n- [ ] A viewer scoped to project A sees no events for project B and no `access.*` events.\n- [ ] Admin output is unchanged.\n- [ ] A storetest case confirms the project_id column is populated for run and model writes.\n- [ ] A handler test in `access_test.go` covers the scoped case."
+  },
+  {
+    "title": "Authorize and attribute agent trace ingestion to the calling identity",
+    "labels": [
+      "security",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\n`recordTrace` (`go/internal/httpapi/server.go:1465-1473`) accepts any `agent_id` and has no `agentAllowed` check:\n- `engineerWrite` includes `/api/v1/traces` (`go/internal/auth/auth.go`, `engineerWrite`), so a project-scoped engineer can inject traces, sessions and token or cost usage into agents in other projects.\n- `Postgres.RecordTrace` does not check that the agent exists, and always records the actor as `\"trace-proxy\"` (`go/internal/store/postgres.go:635-641`). The audit trail hides who wrote the data.\n\nThe forged values flow into `agentUsage` cost totals (`server.go:1448-1463`).\n\n## Proposal\n- Restrict `POST /api/v1/traces` to the `service` role, matching the users-blocked rule in `machineReportingPath`. Alternatively, require `agentAllowed` and agent existence.\n- Pass `actor(r)` to `RecordTrace` instead of the hard-coded string.\n\n## Acceptance criteria\n- [ ] An engineer scoped to project A gets 403 or 404 posting a trace for an agent in project B.\n- [ ] A trace for a nonexistent agent returns 404.\n- [ ] Audit events for traces carry the real caller subject.\n- [ ] A handler test covers the service, engineer and user cases."
+  },
+  {
+    "title": "Rate-limit JWKS refreshes triggered by unknown key IDs",
+    "labels": [
+      "security",
+      "P2",
+      "area:auth"
+    ],
+    "body": "## Problem\nA bad `kid` triggers a network call on every request:\n- `Verifier.key` calls `refresh` whenever the `kid` is not cached (`go/internal/auth/auth.go:226-240` at d1e239c).\n- `refresh` makes an outbound HTTP request to `OIDC_JWKS_URL` with a 5 s client timeout (`auth.go:83`).\n- Any unauthenticated request with a bearer token carrying a random `kid` header causes one JWKS fetch. Signature validation happens after key lookup.\n- Concurrent requests after cache expiry (10 minutes, `auth.go:292`) all refresh at once.\n\nAn attacker can amplify traffic against the IdP and hold gateway goroutines for up to 5 s per request. This is separate from the planned Dex login work; it concerns the bearer verifier.\n\n## Proposal\n- Wrap `refresh` in `singleflight`.\n- Allow at most one forced refresh per 30 s for unknown kids, and answer unknown kids from the negative cache in between.\n- Refresh the cache in the background before expiry instead of on the request path.\n- Expose a counter `kionga_auth_jwks_refresh_total{result}`.\n\n## Acceptance criteria\n- [ ] A test with an `httptest` JWKS server sends 100 parallel tokens with random kids; the JWKS server sees at most 1 request.\n- [ ] A legitimately rotated key is accepted within the refresh window.\n- [ ] A JWKS outage during refresh keeps serving the previous keys until a hard expiry."
+  },
+  {
+    "title": "Add login throttling and Secure cookies to local password sign-in",
+    "labels": [
+      "security",
+      "P2",
+      "area:auth"
+    ],
+    "body": "## Problem\nLocal sign-in has three gaps (line numbers at d1e239c):\n- `POST /auth/local/login` (`go/internal/auth/local_session.go:63,104-123`) has no rate limiting, backoff or lockout. Provisioned local accounts (`go/internal/httpapi/local_accounts.go`) and the bootstrap admin can be brute-forced.\n- The session cookie is set without `Secure` (`local_session.go:118-121`), unlike the OIDC cookie (`session.go:132`). Local mode is also used behind TLS in staging.\n- When `MLAIOPS_LOCAL_PASSWORD` is unset, the gateway silently falls back to the public default `mlaiops-local` (`go/cmd/gateway/main.go:137-140`) unless `KIONGA_ENVIRONMENT=production`.\n\n## Proposal\n- Add a per-username and per-IP token bucket (for example 5 attempts per minute, then exponential delay). Record `auth.login_failed` audit events.\n- Set `Secure` when the request is TLS or `X-Forwarded-Proto=https`, reusing `secureCookies` logic.\n- Refuse to start with the default password unless `KIONGA_ENVIRONMENT=development`. Add `MLAIOPS_LOCAL_PASSWORD` to `runtimeconfig.SecretNames` so `_FILE` works.\n\n## Acceptance criteria\n- [ ] The 6th wrong attempt within a minute returns the error page without calling `verify` (unit test with an injected clock).\n- [ ] Cookie has `Secure` under TLS (httptest TLS server test).\n- [ ] Startup fails when the password is unset outside development.\n- [ ] `MLAIOPS_LOCAL_PASSWORD_FILE` is honored."
+  },
+  {
+    "title": "Persist local sessions and purge expired entries",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:auth"
+    ],
+    "body": "## Problem\n`LocalSessionManager` keeps sessions in a process-local `map[string]localSession` (`go/internal/auth/local_session.go:33,116` at d1e239c). This causes three problems:\n- Expired entries are only rejected, never deleted (`local_session.go:145`), so the map grows with every login.\n- Sessions vanish on restart, which logs every user out on each deploy.\n- With more than one gateway replica, a request routed to another pod is unauthenticated.\n\nWorkspace edge sessions already live in Postgres with a purge loop (`go/cmd/gateway/main.go:53-66`). Local sessions do not.\n\n## Proposal\n- Store hashed local session tokens through `store.Documents`, or a `local_sessions` table with an `expires_at` index.\n- Reuse the hourly purge goroutine.\n- Keep an in-memory LRU cache with a short TTL in front of it.\n\n## Acceptance criteria\n- [ ] A session created on manager A is accepted by manager B sharing the same repository (test).\n- [ ] Expired sessions are removed by the purge job (test with fake clock).\n- [ ] Only the SHA-256 of the token is stored.\n- [ ] Logout deletes the persisted session."
+  },
+  {
+    "title": "Send CSP and baseline security headers on console and API responses",
+    "labels": [
+      "security",
+      "P2",
+      "area:console"
+    ],
+    "body": "## Problem\nThe console and API responses carry no browser-hardening headers:\n- Static console files are served by a bare `http.FileServer` (`go/internal/httpapi/server.go:124`).\n- API responses go through `writeJSON` (`server.go:1572-1576`) with no `Content-Security-Policy`, `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`/`frame-ancestors` or HSTS.\n- Only the workspace edge (`go/internal/httpapi/workspace_edge.go:88-90`) and editorial media (`editorial.go:597-598`) set any.\n\nThe console builds markup with `innerHTML` in about 141 places across `go/cmd/gateway/web/js`, `web/*.js` and `web/editorial`. One missed `escapeHTML` call becomes stored XSS with full session access. The HTML pages contain no inline `<script>` blocks, so a strict `script-src 'self'` is achievable.\n\n## Proposal\nAdd a `securityHeaders` middleware in `httpapi.New` that sets:\n- `Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'`\n- `style-src 'self' 'unsafe-inline'`, until inline `style=` attributes in `pipeline-graph.js` are removed\n- `nosniff`\n- `Referrer-Policy: same-origin`\n- HSTS when TLS is used\n\nRoll out first with `Content-Security-Policy-Report-Only` and a report endpoint.\n\n## Acceptance criteria\n- [ ] `GET /console.html` and `GET /api/v1/me` include the headers (httptest).\n- [ ] Playwright console-audit spec runs with no CSP violations in the browser console.\n- [ ] Workspace proxy responses keep their own CSP (no regression in `workspaces.go:414-429` tests)."
+  },
+  {
+    "title": "Drain the gateway on SIGTERM before exiting and stop background workers cleanly",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nLine numbers at d1e239c. In `go/cmd/gateway/main.go:158-167`, `server.ListenAndServe()` returns `ErrServerClosed` as soon as `Shutdown` starts. `main` then returns right away:\n- In-flight requests are not drained.\n- Deferred `postgres.Close()` (`main.go:52`) runs while handlers are still using the pool.\n- The scheduler, log retention, editorial publisher, outbox worker and dispatched executors are never awaited (`main.go:69-70,109-111`).\n\nThe workspace listener is stopped with `Close()`, not `Shutdown()` (`main.go:107`). SSE handlers (`/api/v1/events`, `/api/v1/logs/stream`) never watch for shutdown, so `Shutdown` would wait for its full timeout anyway.\n\nOther binaries have no graceful shutdown at all:\n- `go/cmd/storage-proxy/main.go:81`\n- `go/cmd/feature-gateway/main.go:199`\n- `go/cmd/metrics-collector/main.go:38`\n\n## Proposal\n- Run `ListenAndServe` in a goroutine and block on `ctx.Done()`. Then call `Shutdown` on all listeners with a deadline, and wait on a `sync.WaitGroup` that every background worker registers with.\n- Use `server.RegisterOnShutdown` to cancel a context that SSE handlers select on.\n- Make `/api/v1/ready` return 503 once draining starts.\n- Apply the same pattern to the three binaries listed above.\n\n## Acceptance criteria\n- [ ] A test sends SIGTERM (or cancels ctx) while a slow handler runs. The handler completes and the process exits only afterwards.\n- [ ] Open SSE connections close within 1 s of shutdown.\n- [ ] `/api/v1/ready` returns 503 during the drain.\n- [ ] storage-proxy, feature-gateway and metrics-collector handle SIGTERM with `Shutdown`."
+  },
+  {
+    "title": "Set per-route write deadlines so SSE and long proxies are not cut at 30 s",
+    "labels": [
+      "bug",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nThe gateway server sets `WriteTimeout: 30 * time.Second` (`go/cmd/gateway/main.go:157` at d1e239c). Several handlers need longer:\n- `/api/v1/events` (`go/internal/httpapi/server.go:782-823`) streams SSE but never clears the write deadline. `streamLogs` does clear it (`logs.go:279-281`). The console's EventSource (`web/js/core.js:447-456`) is therefore dropped every 30 s and flips to \"Reconnecting\".\n- `invokeAgent` waits up to 120 s for the runtime (`server.go:1420`).\n- `requestServing` waits up to 90 s (`server.go:1161`).\n- `predictModel` waits up to 30 s (`server.go:1239`).\n\nResponses slower than 30 s are cut off while the upstream work continues, so the client sees a network error for a request that succeeded.\n\n## Proposal\n- Clear the deadline in `events` with `http.NewResponseController(w).SetWriteDeadline(time.Time{})`.\n- For proxy handlers, extend the deadline to the client timeout plus a margin with `SetWriteDeadline`.\n- Put these timeouts into named constants in one place.\n\n## Acceptance criteria\n- [ ] A test with `httptest.NewUnstartedServer` and `WriteTimeout=1s` shows `/api/v1/events` still delivering frames after 2 s.\n- [ ] A stubbed agent runtime that responds after 35 s returns 200 to the caller.\n- [ ] Playwright console-audit no longer shows periodic `Reconnecting` state during a 60 s idle."
+  },
+  {
+    "title": "Make the outbox worker safe across replicas with retries, backoff and retention",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:store"
+    ],
+    "body": "## Problem\n`PendingOutbox` uses `FOR UPDATE SKIP LOCKED` through `p.pool.Query` with no transaction (`go/internal/store/postgres.go:744-759`). The row locks are released when that statement's implicit transaction ends. Every replica running `OutboxWorker` (`go/cmd/gateway/main.go:68-71`) can therefore read and publish the same events, which causes duplicate Kafka commands.\n\n`Flush` (`go/internal/store/outbox.go:42-61`) has three more problems:\n- It retries failed and poison events every second forever, with no max attempts or backoff.\n- A `MarkPublished` error aborts the batch after the event was already published.\n- Published rows are never deleted, so `outbox_events` grows without bound (`migrations/001_initial.sql:26-40`).\n\n## Proposal\n- Claim a batch inside a transaction by setting `claimed_by` and `claimed_until`, then commit. Publish, then mark the rows published.\n- Add `next_attempt_at` with exponential backoff and a `dead` state after N attempts.\n- Have a retention job delete rows that were published more than 7 days ago.\n- Document consumer-side idempotency keyed on the event `id`.\n\n## Acceptance criteria\n- [ ] An integration test (`go/integration`) runs two workers on one database. Each event is published exactly once.\n- [ ] A publisher that always fails stops retrying after the configured attempts, and the event shows as dead.\n- [ ] Published rows older than the retention window are purged.\n- [ ] A gauge `kionga_outbox_pending` and a counter `kionga_outbox_dead_total` are exported."
+  },
+  {
+    "title": "Track applied database migrations in a versioned schema table",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:store"
+    ],
+    "body": "## Problem\n`Postgres.Migrate` (`go/internal/store/postgres.go:66-96`) re-runs every embedded `migrations/*.sql` file on every gateway start, under an advisory lock. This only works while each file is fully idempotent (`CREATE ... IF NOT EXISTS`, `DROP POLICY IF EXISTS`). Consequences:\n- A non-idempotent change, such as a column rename, a data backfill or `ALTER TYPE`, cannot be expressed.\n- Startup repeats DDL that takes locks on hot tables.\n- No version is recorded, so operators cannot tell which schema a database has.\n- A failed migration leaves earlier files applied with no record of where it stopped.\n\n## Proposal\n- Add a `schema_migrations(version, checksum, applied_at)` table.\n- Apply each pending file in its own transaction, record its checksum, and refuse to start when an applied file's checksum has changed.\n- Add `mlaiops-gateway migrate --dry-run`, or expose the applied version in `/api/v1/ready` details.\n\n## Acceptance criteria\n- [ ] An integration test starts twice and sees the second start execute zero migration files.\n- [ ] Editing an applied migration's content makes startup fail with a checksum error.\n- [ ] A migration that fails mid-way leaves `schema_migrations` without its row, and the transaction is rolled back.\n- [ ] The current version is logged at startup."
+  },
+  {
+    "title": "Resolve API tokens by indexed lookup instead of scanning and rewriting all tokens",
+    "labels": [
+      "performance",
+      "P2",
+      "area:auth"
+    ],
+    "body": "## Problem\nEvery request that carries an `nxs_` token calls `Postgres.ResolveAPIToken` (`go/internal/store/postgres.go:206-218`). That function:\n- Loads and JSON-decodes every `api_token` row in the tenant via `list` (`postgres.go:771-789`).\n- Hashes candidates in a loop.\n- Rewrites the full token payload to update `LastUsedAt` on every request (`postgres.go:210-212`), ignoring the error and using `context.Background()`.\n\n`APITokensFor` also loads all tokens and filters them in Go (`postgres.go:113-121`). API-heavy clients such as the CLI and SDK therefore cost O(tokens) reads plus one write per call.\n\n## Proposal\n- Give tokens a dedicated table, or an expression index on `payload->>'prefix'` and `payload->>'subject'`.\n- Look up by prefix, which is derived from the token id (`tokens.go:45-55`), then compare the hash in constant time.\n- Throttle `last_used_at` updates (at most once per minute per token) and use a column update, not a payload rewrite.\n\n## Acceptance criteria\n- [ ] `ResolveAPIToken` issues one indexed SELECT. The integration test asserts this via `EXPLAIN`, or by counting queries with a pgx tracer.\n- [ ] 100 consecutive requests with one token produce at most 2 writes.\n- [ ] Revoked and expired tokens are still rejected (existing `tokens_test.go` passes for both stores).\n- [ ] A benchmark `BenchmarkResolveAPIToken` with 5k tokens is added."
+  },
+  {
+    "title": "Add cursor pagination to list endpoints and the audit log",
+    "labels": [
+      "performance",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nEvery list endpoint returns the whole collection:\n- `api.Page[T]` has only `Items` and `Total` (`go/pkg/api/types.go:712-715`).\n- Handlers such as `runs`, `models`, `agents`, `tools` and `connections` (`go/internal/httpapi/server.go:485,1083,1251,1475,1490`) send the full set.\n- The generic `list[T]` loads and decodes every row of a kind (`go/internal/store/postgres.go:771-789`) before filtering in Go.\n- `PipelineRun` embeds up to 500 inline log lines (`go/internal/store/store.go:347`), so `/api/v1/pipelines/runs` grows with run history multiplied by log volume.\n- `Audit` is capped at a fixed `LIMIT 500` with no cursor (`postgres.go:311-312`), so older events cannot be reached through the API. The file store returns the full audit slice.\n\n## Proposal\n- Add `limit` (default 50, max 200) and an opaque `cursor` (`created_at,id`) to list endpoints. Return `next_cursor` in `Page`.\n- Push filtering into SQL with `ORDER BY created_at DESC, id DESC LIMIT $n` and add an index on `(tenant_id, kind, created_at, id)`.\n- Drop inline `logs` from list responses (keep them on `GET /runs/{id}`).\n- Paginate `/api/v1/audit` with keyset pagination on `sequence`.\n\n## Acceptance criteria\n- [ ] `GET /api/v1/pipelines/runs?limit=2` returns 2 items and a `next_cursor`. Following the cursors visits every run exactly once (storetest conformance on both stores).\n- [ ] `GET /api/v1/audit?cursor=...` reaches events older than the newest 500.\n- [ ] Run list items omit `logs`.\n- [ ] The console views keep working (tests/ui updated) and the OpenAPI document describes the parameters."
+  },
+  {
+    "title": "Compute the live events digest incrementally instead of reloading all state every 3 s",
+    "labels": [
+      "performance",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nEach open console tab holds an EventSource on `/api/v1/events` (`go/cmd/gateway/web/js/core.js:447`). Every 3 s per connection, the handler (`go/internal/httpapi/server.go:782-823`) does all of the following:\n- Rebuilds an authorizer, which loads groups and attached policies.\n- Calls `digestFor` (`server.go:825-828`), which loads and decodes every pipeline run (`s.store.Runs()`), plus agents and features.\n- Sends the digest even when nothing has changed.\n\nWith N users online, that is N full scans of `platform_resources` every 3 s. The cost grows with total run history, not with change rate.\n\n## Proposal\n- Keep a tenant-level change sequence: the max `audit_events.sequence` or a `LISTEN/NOTIFY` channel.\n- Recompute a caller's digest only when the sequence moves, and send frames only on change, with a 15 s keep-alive comment.\n- Cache the authorizer per connection and invalidate it on IAM change events.\n\n## Acceptance criteria\n- [ ] With no writes, a connection performs at most one repository scan per minute (test with a counting fake repository).\n- [ ] A run submission reaches open streams within 3 s.\n- [ ] Policy changes still apply to open streams (existing `events_test.go` passes).\n- [ ] Identical digests are not re-sent."
+  },
+  {
+    "title": "Index log search and replace per-connection 1 s polling in log streaming",
+    "labels": [
+      "performance",
+      "P2",
+      "area:logs"
+    ],
+    "body": "## Problem\nFree-text log search and log streaming both scale poorly:\n- `QueryLogs` implements `q` as `message ILIKE '%term%'` (`go/internal/store/logs.go:193`). `004_log_entries.sql` has no trigram or full-text index, so every search scans the tenant's whole log table (up to 30 days by default, `logs.go:331-340`).\n- `streamLogs` runs that query every second for every open stream (`go/internal/httpapi/logs.go:285-319`).\n- It rebuilds the policy authorizer for each page (`visibleLogs`, `logs.go:199-212`).\n\nA few engineers tailing logs with a filter keep the database busy with sequential scans.\n\n## Proposal\n- Add `CREATE EXTENSION IF NOT EXISTS pg_trgm` and a GIN trigram index on `message`, or a `tsvector` column.\n- Drive streams from a shared poller: one query per tenant per tick, fanned out to subscribers in memory, or from `LISTEN/NOTIFY` on insert.\n- Cache the authorizer for each stream.\n- Cap concurrent streams per subject.\n\n## Acceptance criteria\n- [ ] `EXPLAIN` for a `q` search uses the trigram index (integration test).\n- [ ] Ten streams on the same tenant cause one query per tick (counting fake `LogStore`).\n- [ ] Opening more than the per-subject limit of streams returns 429.\n- [ ] `storetest.Logs` still passes on both backends."
+  },
+  {
+    "title": "Fix lost log cursors for oversized limits and UTF-8 unsafe truncation",
+    "labels": [
+      "bug",
+      "P3",
+      "area:logs"
+    ],
+    "body": "## Problem\n- `queryLogs` decides whether to return a cursor with `full := len(entries) == filter.Limit || (filter.Limit == 0 && len(entries) == 200)` (`go/internal/httpapi/logs.go:242`). The store silently clamps limits that are `<= 0` or `> 1000` to 200 (`go/internal/store/logs.go:29-30`). A request with `limit=5000` gets 200 rows and no `next_after` or `next_before`, so clients assume they have everything. Negative limits behave the same way.\n- `truncateMessage` cuts at byte 8192 (`logs.go:59-64`), which can split a multi-byte rune. Invalid UTF-8 is then stored and exported to OpenSearch by `logexport`.\n- `queryLogs` returns raw database errors to clients (`logs.go:239`).\n\n## Proposal\n- Normalize the limit once in the handler with a shared `store.NormalizeLogLimit` and compare against the normalized value. Return 400 for limits above `MaxLogQuery`.\n- Truncate on a rune boundary, for example by backing off with `utf8.RuneStart`.\n- Log the database error and return a generic message.\n\n## Acceptance criteria\n- [ ] `GET /api/v1/logs?limit=5000` returns 400, or returns a cursor when the page is full (test in `logs_test.go`).\n- [ ] A message of 8191 ASCII bytes followed by a 3-byte rune truncates to valid UTF-8 (`utf8.ValidString`).\n- [ ] Error responses no longer contain SQL text."
+  },
+  {
+    "title": "Redact secrets in structured log context, not only in the message",
+    "labels": [
+      "security",
+      "P2",
+      "area:logs"
+    ],
+    "body": "## Problem\n`appendLogs` runs `redact.String` on `Message` only (`go/internal/httpapi/logs.go:49`). `ingestRunLogs` copies the runner-supplied `Context` map unchanged (`logs.go:127-133`). The context is stored as JSONB, returned by `/api/v1/logs` and exported by `cmd/log-exporter`, so anything a runner puts there leaves the cluster:\n- env snapshots\n- HTTP headers\n- connection strings\n\nTo verify: whether the Python SDK runner currently puts env or headers into `context`. The API accepts arbitrary maps either way.\n\n## Proposal\n- Walk `Context` recursively and apply `redact.String` to string values.\n- Drop values whose keys match `(?i)(token|secret|password|authorization|api[_-]?key)`.\n- Cap context size (for example 8 KiB serialized) and nesting depth.\n\n## Acceptance criteria\n- [ ] Ingesting `{\"context\":{\"headers\":{\"Authorization\":\"Bearer abc\"},\"dsn\":\"postgres://u:p@h/db\"}}` stores redacted values (test in `logs_test.go`).\n- [ ] Oversized context is truncated with a marker.\n- [ ] `logexport` tests confirm redacted values are what is exported."
+  },
+  {
+    "title": "Log and count every gateway response with status, route and request ID",
+    "labels": [
+      "observability",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nThe gateway's request logs and metrics miss most of what an operator needs:\n- The `logging` middleware wraps only the mux, CORS and RBAC (`go/internal/httpapi/server.go:132`). The OIDC, local-session and API-token middlewares are added outside it in `main.go` (`go/cmd/gateway/main.go:130,141,144` at d1e239c). Every 401 they return is neither logged nor counted.\n- The middleware does not capture status codes. `requests_total` has only `method` and a 6-value `category` label (`go/internal/httpapi/metrics.go:12-41`), so error rates per route cannot be computed.\n- No request ID is generated or propagated to upstream calls (agent runtime, serving manager, storage proxy).\n- Logs are unstructured `log.Printf` (about 59 call sites across `go/internal` and `go/cmd`).\n- The custom registry does not register Go runtime or process collectors (`metrics.go:11`).\n\n## Proposal\n- Move logging and metrics to the outermost handler in `main.go`.\n- Wrap the `ResponseWriter` to capture status and bytes, and label metrics with the matched `r.Pattern` (Go 1.22 mux).\n- Generate or accept `X-Request-ID`, put it in the context, and forward it on outbound requests.\n- Switch to `log/slog` with a JSON handler.\n- Register `collectors.NewGoCollector()` and `collectors.NewProcessCollector()`.\n\n## Acceptance criteria\n- [ ] A 401 from `APITokenMiddleware` increments `kionga_gateway_requests_total{status=\"401\"}` (test).\n- [ ] Each API log line is JSON with `request_id`, `route`, `status`, `duration_ms` and `subject`.\n- [ ] Outbound proxy requests carry the same `X-Request-ID`.\n- [ ] `/metrics` exposes `go_goroutines` and `process_resident_memory_bytes`."
+  },
+  {
+    "title": "Export scheduler, outbox and executor metrics",
+    "labels": [
+      "observability",
+      "P3",
+      "area:pipelines"
+    ],
+    "body": "## Problem\nThe pipeline background machinery reports nothing to Prometheus:\n- `scheduler.Scheduler` has a `Fired` hook documented as being for \"tests and metrics\" (`go/internal/scheduler/scheduler.go:51-52`). `StartScheduler` never sets it (`go/internal/httpapi/scheduled_runs.go:27`), so missed, skipped and failed schedule slots appear only in `log.Printf` (`scheduler.go:219-225`).\n- The outbox worker (`go/internal/store/outbox.go`) exposes no backlog or failure counts.\n- The Kubernetes executor (`go/internal/k8sexec/executor.go`) exposes no Job creation, retry or failure counts.\n\nOperators cannot alert on \"schedules are not firing\" or \"Kafka publishing is stuck\".\n\n## Proposal\nAdd these metrics:\n- `kionga_scheduler_slots_total{outcome}` (fired, skipped, error)\n- `kionga_scheduler_leader` gauge\n- `kionga_scheduler_lag_seconds` (now minus slot)\n- `kionga_outbox_pending` and `kionga_outbox_publish_failures_total`\n- `kionga_executor_jobs_total{result}`\n- `kionga_executor_node_duration_seconds`\n\nRegister them on `httpRegistry`.\n\n## Acceptance criteria\n- [ ] `StartScheduler` wires `Fired` to the counter, and a unit test asserts the increments.\n- [ ] Exactly one replica reports `kionga_scheduler_leader 1` (test with two schedulers on one store).\n- [ ] The metrics appear on `METRICS_PORT` /metrics.\n- [ ] Example alert rules are added next to the existing deploy manifests or documented in the package comment."
+  },
+  {
+    "title": "Unify API error codes and stop returning internal error text as 422",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nError responses are inconsistent and leak internal details:\n- `writeMutation` maps every error that is not `ErrNotFound` or `ErrConflict` to `422 validation_error` with `err.Error()` (`go/internal/httpapi/server.go:1538-1551`). Database failures from pgx, such as connection loss or context deadlines, reach clients as validation errors with SQL text.\n- Auth middleware errors use `{\"error\": http.StatusText(status)}` (`go/internal/auth/auth.go:487-491` at d1e239c), for example `\"Forbidden\"`. Handlers use snake_case codes like `access_denied`, so clients cannot switch on `error` reliably.\n- Upstream proxy errors echo internal URLs (`server.go:704-713` for the storage proxy, `1415,1423` for the agent runtime).\n\n## Proposal\n- Add `store.ValidationError` and return it from validation paths.\n- In `writeMutation`, map unknown errors to `500 internal` with a request ID and log the details.\n- Make `auth.deny` emit the same codes (`unauthenticated`, `forbidden`).\n- Document the code list in OpenAPI `components/schemas/APIError`.\n\n## Acceptance criteria\n- [ ] A fake repository returning `errors.New(\"pq: connection reset\")` yields 500 with a message that does not contain `pq:`.\n- [ ] Validation failures still return 422 with their message.\n- [ ] 401 and 403 from the auth middleware have `error` in snake_case (test in `rbac_test.go`).\n- [ ] Proxy failures do not include upstream hostnames."
+  },
+  {
+    "title": "Generate the OpenAPI document from registered routes and fail CI on drift",
+    "labels": [
+      "docs",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\n`/api/openapi.json` is a hand-written map of summaries (`go/internal/httpapi/openapi.go:16-93`):\n- It has no request or response schemas, parameters or security schemes.\n- About 122 distinct `/api/v1` route patterns are registered across `server.go`, `iam.go`, `feature_stores.go`, `editorial.go`, `logs.go`, `pipeline_definitions.go`, `scaffold_jobs.go`, `run_preflight.go` and `local_accounts.go`. Only about 70 paths appear in `openapi.go`, plus the IAM entries added in `iam.go:33`.\n- Undocumented routes include `/api/v1/logs/stream`, `POST /api/v1/pipelines/runs/{id}/logs`, the `/api/v1/admin/feature-stores` family and `/api/v1/editorial/members`.\n- No test checks coverage. `api-docs.html` therefore shows an incomplete API.\n\n## Proposal\n- Register routes through a helper that records method, pattern, summary and the request and response types in one table, so `New` and `openapi` share a source.\n- Generate JSON schemas for `pkg/api` types with reflection or `kin-openapi`.\n- Add a test that walks the mux registrations and fails when any route is missing from the document.\n\n## Acceptance criteria\n- [ ] A test asserts that every registered `/api/` method and pattern pair appears in `openapi.json`.\n- [ ] The document validates against the OpenAPI 3.0 schema in CI.\n- [ ] `bearerAuth` and `cookieAuth` security schemes are declared, and public routes are marked `security: []`.\n- [ ] At least the pipelines, logs and tokens endpoints include request and response schemas."
+  },
+  {
+    "title": "Run the PostgreSQL store integration test in CI instead of skipping it",
+    "labels": [
+      "testing",
+      "P2",
+      "area:store"
+    ],
+    "body": "## Problem\n`go/internal/store/workspace_edge_integration_test.go:10-12` skips unless `TEST_DATABASE_URL` is set. The CI workflow sets that variable only for `go test -tags=integration ./integration` (`.github/workflows/cicd.yml:50-52`). The `go test -race ./...` step (`cicd.yml:49`) has no URL, so the workspace-edge session test never runs in CI. `scripts/integration-test.sh` also targets only `./integration`.\n\nThere are also gaps in what the integration suite covers:\n- No test for concurrent outbox consumers (`PendingOutbox`).\n- No test for `ResolveAPIToken` revocation and expiry against Postgres.\n- No test for RLS isolation between two tenants.\n\n## Proposal\n- Put the store integration test behind the `integration` build tag, and run `go test -tags=integration ./integration ./internal/store/...` in CI and in `scripts/integration-test.sh`.\n- Add a two-tenant RLS test that opens `OpenPostgres` with tenants A and B and asserts B cannot read A's resources or logs.\n\n## Acceptance criteria\n- [ ] The CI log shows `TestWorkspaceEdge*` executed, not skipped.\n- [ ] A new RLS test fails if `FORCE ROW LEVEL SECURITY` is removed from a migration.\n- [ ] `make test-integration` runs the same package set as CI."
+  },
+  {
+    "title": "Add tests for storage-proxy, integration-worker, log-exporter and metrics-collector entrypoints",
+    "labels": [
+      "testing",
+      "P3",
+      "area:api"
+    ],
+    "body": "## Problem\nSix command packages have no tests:\n- `go/cmd/gateway`\n- `go/cmd/storage-proxy`\n- `go/cmd/integration-worker`\n- `go/cmd/log-exporter`\n- `go/cmd/metrics-collector`\n- `go/cmd/operator`\n\nSeveral contain real logic, not just wiring. `storage-proxy/main.go:24-87` holds the HTTP handlers and auth check in `main`. `integration-worker/main.go:31-80` contains its shutdown sequence. Bugs such as the fail-open auth in storage-proxy are invisible to `go test ./...`.\n\n## Proposal\n- Extract a `newHandler(config) http.Handler` (or `run(ctx, env) error`) from each `main`, leaving `main` as a thin wrapper.\n- Add httptest-based tests for routes, auth and shutdown.\n- For the gateway, test that middleware order makes auth run before RBAC and that production config validation stops startup.\n\n## Acceptance criteria\n- [ ] Each listed package has at least one `_test.go` that exercises its handler or run function.\n- [ ] The storage-proxy tests cover missing and incorrect tokens.\n- [ ] A gateway test asserts an unauthenticated `/api/v1/projects` request gets 401 in OIDC mode.\n- [ ] `go test -cover ./cmd/...` reports non-zero coverage for every listed package."
+  },
+  {
+    "title": "Extend axe accessibility scans to login, editorial, blog and workspace pages",
+    "labels": [
+      "accessibility",
+      "P3",
+      "area:console"
+    ],
+    "body": "## Problem\n`tests/e2e/accessibility.spec.cjs:6` scans only the 16 `console.html?view=` views. The other user-facing pages ship from `go/cmd/gateway/web` and are never checked against WCAG 2.1 AA:\n- `login.html`\n- `editorial.html` and the block editor in `web/editorial/editor.js`\n- `blogs.html` and `blog.html`\n- `index.html` (landing tabs at lines 38-44)\n- `workspace.html`\n\nThe console scan also covers only first render, not dialogs or the pipeline editor. Neither the Playwright suite nor axe runs in CI (`.github/workflows/cicd.yml` runs only `test:ui` and `node --check`).\n\n## Proposal\n- Parameterize the spec over a page list, including the editorial editor with a draft open, the login error state and the pipeline editor dialog.\n- Add keyboard-only checks: Tab order reaches every form control, and Escape closes dialogs.\n- Add a CI job that starts the gateway with the file store and runs the a11y spec in headless Chromium.\n\n## Acceptance criteria\n- [ ] The spec covers login, editorial (list and editor), blogs, blog, landing and workspace pages.\n- [ ] Serious and critical axe violations fail the job.\n- [ ] A keyboard test opens and closes the pipeline editor dialog without a mouse.\n- [ ] The job runs on pull requests."
+  },
+  {
+    "title": "Split server.go into domain files using the existing route registrar",
+    "labels": [
+      "refactor",
+      "P3",
+      "area:api"
+    ],
+    "body": "## Problem\n`go/internal/httpapi/server.go` is 1615 lines and registers about 80 routes inline in `New` (`server.go:41-120`). It mixes these domains:\n- users and access\n- tokens\n- projects\n- pipelines\n- storage proxy\n- prompts\n- SSE events\n- functions\n- models and serving\n- agents\n- tools\n- connections\n- audit\n- shared helpers\n\n`routes.go:5-12` already provides `registerRoutes`, \"so independent work never edits the shared route table in New\". It is used by `logs.go`, `iam.go`, `editorial.go` and others, but not by the code in `server.go`. Every change to models or agents conflicts in the same file.\n\n## Proposal\n- Move each domain into its own file, for example `models.go`, `agents.go`, `functions.go`, `tokens.go`, `access_admin.go`, `storage_proxy.go` and `events.go`, each with an `init()` registrar.\n- Keep `New` to construction, middleware and static files.\n- Move helpers (`writeJSON`, `decode`, `writeMutation`, `actor`) into `respond.go`.\n- Do not change behavior.\n\n## Acceptance criteria\n- [ ] `server.go` is under 300 lines.\n- [ ] No route is registered in `New` except health, ready, openapi and static.\n- [ ] `go test ./internal/httpapi` passes unchanged, and a route-count test confirms the same set of method and pattern pairs."
+  },
+  {
+    "title": "Centralize bootstrap identity configuration instead of re-reading env in each package",
+    "labels": [
+      "refactor",
+      "P3",
+      "area:auth"
+    ],
+    "body": "## Problem\n`MLAIOPS_LOCAL_USERNAME` and `MLAIOPS_LOCAL_ROLE`, together with their defaults (`admin` and `RoleAdmin`), are read and defaulted separately in at least nine places:\n- `go/cmd/gateway/main.go:96,133`\n- `go/internal/auth/auth.go:180`\n- `go/internal/auth/local_session.go:48`\n- `go/internal/httpapi/editorial.go:164`\n- `go/internal/httpapi/scheduled_runs.go:46-55`\n- `go/internal/httpapi/iam.go:105,115,629`\n- `go/internal/httpapi/workspaces.go:125`\n\nThe copies already disagree:\n- `auth.go:180` applies `strings.TrimSpace` and the others do not.\n- `workspaces.go:125` hard-codes `\"admin\"` as an extra fallback.\n\nSecurity decisions (bootstrap rights, schedule owner resolution, local-dev principal) depend on all copies agreeing, and tests must set env vars globally.\n\n## Proposal\n- Add a `BootstrapIdentity{Subject, Role, OIDCEnabled}` struct, built once in `main` from `runtimeconfig`.\n- Inject it into `auth.LocalSessionManager`, `auth.RBACWithResolver` and `httpapi.Server`.\n- Replace the direct `os.Getenv` calls.\n\n## Acceptance criteria\n- [ ] `rg 'MLAIOPS_LOCAL_(USERNAME|ROLE)' go/internal` returns only the config package.\n- [ ] Tests construct the identity directly without `t.Setenv`.\n- [ ] Behavior is unchanged under the existing auth and httpapi test suites."
+  },
+  {
+    "title": "Remove the hard-coded seed blog post and migrations from Server construction",
+    "labels": [
+      "bug",
+      "P3",
+      "area:editorial"
+    ],
+    "body": "## Problem\n`httpapi.New` calls `ensureSeedBlog(data)` (`go/internal/httpapi/server.go:38`). That function scans all blog posts and re-creates a 330-line hard-coded article whenever the slug `mounting-s3-as-a-filesystem-in-jupyter` is absent (`go/internal/httpapi/seed_blog.go:8-20`). An editor who deletes or re-slugs that post sees it come back on the next restart, published.\n\nThe editorial registrar also runs `MigrateLegacy` inside route registration (`go/internal/httpapi/editorial.go:46`). As a result:\n- Every replica, and every test that calls `New`, performs content writes at construction time.\n- Errors are only logged.\n\n## Proposal\n- Move demo content into an explicit, idempotent seeding command or a `KIONGA_SEED_DEMO=true` flag. Record that it ran as a document marker, so deletes stick.\n- Run `MigrateLegacy` once from `main` under the migration advisory lock and fail startup on error.\n\n## Acceptance criteria\n- [ ] Deleting the seed post and restarting does not recreate it (test using two `New` calls on one store).\n- [ ] `New` performs no repository writes (test with a write-counting fake repository).\n- [ ] Legacy migration still converts Markdown posts once (existing `editorial` tests pass)."
+  },
+  {
+    "title": "Expire scheduler slot claims and avoid audit writes for lease renewals",
+    "labels": [
+      "reliability",
+      "P3",
+      "area:pipelines"
+    ],
+    "body": "## Problem\nThe scheduler stores far more than it needs to:\n- `claim` creates one `schedule_slot` document per fired slot, and `recordClaim` updates it (`go/internal/scheduler/scheduler.go:182-202`). Nothing deletes them. A schedule that runs every minute adds about 525k documents a year to `platform_resources`.\n- Each claim also writes audit events (`schedule.slot_claimed`, `schedule.slot_fired`), which crowd real user actions out of the 500-row audit view (`go/internal/store/postgres.go:311-312`).\n- The lease is renewed with a write every 15 s (`scheduler.go:204-217`).\n\nTo verify: whether `UpdateDocument` with an empty action also inserts audit and outbox rows. If it does, lease renewals produce about 5.7k audit rows per day.\n\n## Proposal\n- Add a retention sweep that deletes slot claims older than 7 days, run by the lease holder.\n- Skip audit and outbox writes for scheduler-internal documents, or record slot outcomes only on failure.\n- Store the lease in a dedicated row updated with `UPDATE ... WHERE expires_at < now() OR holder = $1`.\n\n## Acceptance criteria\n- [ ] A test with a fake clock shows slot documents older than the retention window are removed.\n- [ ] Lease renewals create zero audit events (storetest assertion).\n- [ ] At-most-once firing per slot still holds (existing `scheduler_test.go` passes)."
+  },
+  {
+    "title": "Add idempotency keys to pipeline submission and make the run quota check atomic",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:pipelines"
+    ],
+    "body": "## Problem\n`submitPipeline` (`go/internal/httpapi/server.go:565-617`) creates a new run for every POST. A client retry after a timeout, or a double click in the console, starts duplicate training runs and duplicate Kubernetes Jobs.\n\nThe concurrency quota is checked in `preflight` and `enforceRunQuota`. That code reads all runs and counts `queued`/`running` (`go/internal/httpapi/access.go:491-509`), separately from the insert in `SubmitPipeline`. Concurrent submissions from one user can therefore both pass the check and exceed `MaxRuns`.\n\n## Proposal\n- Accept an `Idempotency-Key` header on `POST /api/v1/pipelines/submit`, `/runs/{id}/retry` and `/functions/{name}/invoke-async`.\n- Store `(subject, key) -> run_id` for 24 h and return the original response on replay.\n- Run the quota count and the insert in one transaction, with `SELECT ... FOR UPDATE` on a per-subject quota row (Postgres) or under the store mutex (file store).\n- Have the CLI (`go/cmd/cli/main.go:47-50`) send a random key.\n\n## Acceptance criteria\n- [ ] Two submits with the same key return the same `run.id` and create one run.\n- [ ] 10 parallel submits by a user with `MaxRuns=2` create exactly 2 runs (integration test).\n- [ ] A different body with a reused key returns 422.\n- [ ] The OpenAPI document includes the header."
+  },
+  {
+    "title": "Bound request body size for every JSON handler",
+    "labels": [
+      "security",
+      "P2",
+      "area:api"
+    ],
+    "body": "## Problem\nThe shared `decode` helper reads `r.Body` with no size limit (`go/internal/httpapi/server.go:1566-1570`). It serves most mutating endpoints, including models, agents, functions, connections, tokens, access requests, projects, run steps and traces.\n\nOnly a few handlers wrap the body in `http.MaxBytesReader`:\n- `logs.go:109`\n- `pipeline_definitions.go:51,84`\n- `run_preflight.go:351`\n- `editorial.go:457,479,504`\n- `huggingface.go:120,196`\n\nAn authenticated client, or a cross-site attacker if the CSRF issue is not fixed, can stream a very large JSON document for up to `ReadTimeout` (30 s) and drive memory use up. `decode` also accepts trailing data after the first JSON value.\n\n## Proposal\n- Change `decode` to `decode(w, r, target, limit)` with a default of 1 MiB, using `http.MaxBytesReader`.\n- Reject trailing tokens by checking `decoder.More()` or decoding into `struct{}` and expecting `io.EOF`.\n- Map `*http.MaxBytesError` to 413.\n\n## Acceptance criteria\n- [ ] A 2 MiB body to `POST /api/v1/models` returns 413 (test).\n- [ ] `{\"a\":1}{\"b\":2}` returns 400.\n- [ ] The existing per-handler limits are kept or replaced by explicit `decode` limits."
+  },
+  {
+    "title": "Cache agent runtime readiness and share pooled HTTP clients for upstream calls",
+    "labels": [
+      "performance",
+      "P3",
+      "area:api"
+    ],
+    "body": "## Problem\nAgent list requests and upstream proxies do more network work than needed:\n- `GET /api/v1/agents` calls `enrichAgentRuntimeReadiness` (`go/internal/httpapi/server.go:1251-1255,1347-1378`), which sends a live `/healthz` to every visible agent runtime on every request, with up to a 2 s added latency. The console reloads this list after each live event.\n- `agentRuntimeReady` builds a new `http.Client` per probe (`server.go:1330`), and so do 10 other call sites in `server.go` and `workspaces.go` (for example `server.go:710,758,1161,1194,1239,1420` and `workspaces.go:63,296,481,504`).\n- Because those clients all use `http.DefaultTransport`, none of them set per-host connection limits or `ResponseHeaderTimeout`.\n\n## Proposal\n- Have a background prober update agent readiness on an interval (for example every 10 s, or on deploy events), and have the list read the cached state with a `checked_at`.\n- Define a small set of package-level clients with tuned transports: one for internal services and one for external hubs.\n\n## Acceptance criteria\n- [ ] `GET /api/v1/agents` performs zero outbound requests (test with a counting `RoundTripper`).\n- [ ] Readiness changes appear within the probe interval.\n- [ ] `rg '&http.Client\\{' go/internal/httpapi` lists only package-level clients."
+  },
+  {
+    "title": "Share one HTML escape helper across console scripts and syntax-check editorial JS in CI",
+    "labels": [
+      "dx",
+      "P3",
+      "area:console"
+    ],
+    "body": "## Problem\nThe console has five separate HTML-escape implementations:\n- `go/cmd/gateway/web/js/core.js:27` (`escapeHTML`)\n- `web/blog.js:4` (`escapeBlog`)\n- `web/landing.js:111` (`escapeLanding`)\n- `web/pipeline-graph.js:15`\n- `web/editorial/api.js:5` (`esc`)\n\nThese guard about 141 `innerHTML` sinks. A fix to one copy, such as handling backticks in attribute contexts, will not reach the others.\n\nThe CI `node --check` loop (`.github/workflows/cicd.yml:19`) and `make verify` (`Makefile`, `verify` target) cover `web/js/*.js`, `web/js/views/*.js` and `web/*.js` but skip `web/editorial/*.js`. A syntax error in the editorial app ships without detection.\n\n## Proposal\n- Add `web/js/escape.js`, loaded before the other scripts on each page, that exports one `escapeHTML`. Remove the copies.\n- Add a jsdom test in `tests/ui` with HTML attribute and text cases.\n- Extend the CI loop and `make verify` to `go/cmd/gateway/web/editorial/*.js`.\n\n## Acceptance criteria\n- [ ] `rg \"replace\\(/\\[&<>\" go/cmd/gateway/web --glob '!vendor/**'` finds one definition.\n- [ ] A `tests/ui/escape.test.cjs` covers `<`, `&`, quotes and apostrophes.\n- [ ] Introducing a syntax error in `editorial/editor.js` fails CI."
+  },
+  {
+    "title": "Replace string-matched CLI dispatch with subcommands, flags and per-command help",
+    "labels": [
+      "dx",
+      "P3",
+      "area:cli"
+    ],
+    "body": "## Problem\n`go/cmd/cli/main.go:16-62` routes commands in two ways:\n- It joins `os.Args` and compares the result against literal strings in a `switch`.\n- It falls back to positional `len(os.Args)` checks for `pipeline submit`, `function deploy`, `function invoke` and `project connect`.\n\nUsability problems:\n- Function payloads come only from the `MLAIOPS_FUNCTION_PAYLOAD` env var (`main.go:54,56`).\n- There is no `--help` per command, no `--output json|table`, and no way to pass `--token` or `--url` except through env.\n- The HTTP timeout is fixed at 15 s (`main.go:21`), which is shorter than some server operations.\n- Only `pipelines.go` has tests, and the dispatcher is untested.\n\n## Proposal\n- Restructure with the standard `flag` package and a subcommand table, or with `cobra`.\n- Add `--payload @file.json`, `--timeout`, `--output`, plus `--url` and `--token` flags that override env.\n- Return non-zero exit codes mapped from the HTTP status.\n- Generate `kionga help` from the table.\n\n## Acceptance criteria\n- [ ] `kionga function invoke NAME --payload @in.json` works.\n- [ ] `kionga pipeline submit --help` prints usage.\n- [ ] Table-driven tests cover argument parsing for every command against an httptest server.\n- [ ] Existing positional forms still work for one release, with a deprecation warning."
+  },
+  {
+    "title": "Let IAM policies match identity-provider groups asserted at sign-in",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:iam"
+    ],
+    "body": "## Problem\nSingle sign-on now carries the user's identity-provider groups on the principal (`Principal.Groups`, set in `go/internal/auth/auth.go` `Verify`), but only `KIONGA_SSO_GROUP_ROLES` uses them, to pick a coarse platform role. The IAM policy evaluator (`go/internal/policy`) resolves group membership only from Kionga's own group documents, so an LDAP group such as `data-team` cannot be the principal of a policy statement without duplicating membership in Kionga.\n\n## Proposal\n- Add an external-group binding to IAM groups: `{\"external\": {\"provider\": \"ldap\", \"group\": \"data-team\"}}` on a Kionga group document.\n- When evaluating, treat a principal as a member of every Kionga group bound to one of its asserted groups (namespaced by provider so `github:org:team` and `ldap:team` cannot collide).\n- Show bound external groups on the Access page.\n\n## Acceptance criteria\n- [ ] A policy attached to a Kionga group bound to `ldap:data-team` allows a user whose token lists `data-team` from the `ldap` connector, and denies one who does not.\n- [ ] Explicit deny on the bound group still wins.\n- [ ] `/api/v1/iam/explain` names the external group that granted access.\n- [ ] Unit tests in `go/internal/policy` cover binding, namespacing and deny precedence."
+  },
+  {
+    "title": "Provision users from the identity provider just in time and through SCIM",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:auth"
+    ],
+    "body": "## Problem\nA user who signs in through SSO for the first time gets roles only from token groups (`KIONGA_SSO_GROUP_ROLES`); no access profile, project grants or quotas are created for them, and nothing removes access when they leave the directory. Administrators must create profiles by hand under `/api/v1/admin/users/{subject}`, keyed by the opaque Dex subject, which is hard to know in advance.\n\n## Proposal\n- On first SSO sign-in, create a pending access profile keyed by subject with email and groups, and apply a configurable default (`KIONGA_SSO_DEFAULT_PROFILE`), or leave it pending for approval.\n- Add a SCIM 2.0 endpoint (`/scim/v2/Users`, `/scim/v2/Groups`) authenticated by a dedicated token so Okta, Entra and others can create, update and deactivate users and groups.\n- Deactivation revokes sessions and API tokens.\n\n## Acceptance criteria\n- [ ] First sign-in creates exactly one profile; a second sign-in updates email and groups only.\n- [ ] SCIM create, patch (active=false) and delete pass the SCIM conformance basics and revoke access immediately.\n- [ ] Audit events record each provisioning change with the source (sign-in or SCIM).\n- [ ] Docs describe both flows."
+  },
+  {
+    "title": "Show single sign-on status and the signed-in identity's source in the console",
+    "labels": [
+      "ux",
+      "P3",
+      "area:console"
+    ],
+    "body": "## Problem\nAfter the SSO work, the console does not show how a user signed in (local account or which connector), which groups were asserted, or which role mapping applied. Administrators debugging \"signed in but no access\" must read Dex logs (`docs/operations/single-sign-on.md` troubleshooting) instead of the product.\n\n## Proposal\n- Return `sign_in_method`, `connector` and `groups` from `GET /api/v1/me` for SSO principals.\n- Show them on the Settings page, and on the Access page list configured providers (from `/auth/providers`) with the active group-to-role mapping.\n\n## Acceptance criteria\n- [ ] `/api/v1/me` includes the sign-in method and groups for SSO users and `local` for local accounts.\n- [ ] Settings shows them; jsdom test covers both cases.\n- [ ] Access page lists providers and mappings without exposing secrets."
+  }
+]

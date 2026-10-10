@@ -1,0 +1,353 @@
+[
+  {
+    "title": "Stop publishing Postgres, Redis and Kafka ports on all host interfaces",
+    "labels": [
+      "security",
+      "P1",
+      "area:compose"
+    ],
+    "body": "## Problem\n`compose.public.yaml:55-57` gives `postgres`, `redis` and `kafka` only `restart: unless-stopped`. That means the host ports from `compose.yaml` remain published on `0.0.0.0` of the public VM:\n- `compose.yaml:21` `${POSTGRES_PORT:-5432}:5432` with password `mlaiops-local` (`compose.yaml:19`)\n- `compose.yaml:34` Redis `6379` with no auth\n- `compose.yaml:44` Kafka `9092` with `PLAINTEXT` listeners (`compose.yaml:51`)\n\nOther services in the overlay are reset with `ports: []` (`compose.public.yaml:58-90`), but these three are not. Docker-published ports bypass host firewalls such as ufw, so the platform database is reachable from the internet with a password that is in the repository. Locally, every published port also binds to all interfaces and is reachable from the LAN. The exceptions are `log-exporter` (`compose.yaml:228`) and `jupyter` (`compose.yaml:462`), which already bind to `127.0.0.1`.\n\n## Proposal\n- Add `ports: []` for `postgres`, `redis` and `kafka` in `compose.public.yaml`.\n- In `compose.yaml`, prefix every published port with `${KIONGA_BIND_ADDRESS:-127.0.0.1}:` so local stacks are loopback-only unless the user opts in.\n- Document the variable in `.env.example` and the README port table.\n\n## Acceptance criteria\n- [ ] `docker compose -f compose.yaml -f compose.public.yaml config --format json` shows host ports only on `caddy` (80/443).\n- [ ] New test `test_public_overlay_publishes_only_caddy` in `tests/test_local_bootstrap.py` asserts the above.\n- [ ] New test asserts every published port in `compose.yaml` has `host_ip` `127.0.0.1` by default.\n- [ ] `make local-up` and `scripts/demo-smoke.sh` still pass with the loopback defaults."
+  },
+  {
+    "title": "Refuse built-in default credentials when compose.public.yaml is used",
+    "labels": [
+      "security",
+      "P1",
+      "area:secrets"
+    ],
+    "body": "## Problem\n`caddy/Caddyfile:16-18` exposes Langfuse publicly at `/langfuse`. Langfuse bootstraps an admin account with these repository defaults:\n- `LANGFUSE_INIT_USER_PASSWORD` defaults to `mlaiops-local-admin` (`compose.yaml:276`)\n- `NEXTAUTH_SECRET` and `SALT` default to `mlaiops-local-nextauth` / `mlaiops-local-salt` (`compose.yaml:263-264`)\n- Project keys default to `pk-lf-local-dev` / `sk-lf-local-dev` (`compose.yaml:272-273`)\n\n`compose.public.yaml:61-65` overrides only `NEXTAUTH_URL`. `public-up.sh:22` checks six variables, and none of them are these. Other defaults also survive into public mode: `KIONGA_WORKSPACE_API_TOKEN` (`compose.yaml:170`), `JUPYTER_TOKEN` (`compose.yaml:167`), object store keys (`compose.yaml:97-98`) and the Postgres password (`compose.yaml:19`). Anyone who has read this repository can sign in to Langfuse on a legacy public deployment.\n\n## Proposal\n- In `compose.public.yaml`, override each of these with `${VAR:?set VAR in .env}`.\n- Extend the required list in `public-up.sh`. Reject values that equal a known local default.\n- As a follow-up, move these secrets to Compose `secrets:` files, using the same pattern as `vm/compose.yaml:55-59`.\n\n## Acceptance criteria\n- [ ] `docker compose -f compose.yaml -f compose.public.yaml config` fails when any of these variables is unset.\n- [ ] A test resolves the public overlay with a sample `.env` and asserts that no environment value equals an entry in a `LOCAL_DEFAULTS` list.\n- [ ] `public-up.sh` exits non-zero when a variable is set to a local default (shell test).\n- [ ] `.env.example` lists every newly required public secret, with a generation command."
+  },
+  {
+    "title": "Derive Postgres and object store credentials from one variable in every service",
+    "labels": [
+      "bug",
+      "P2",
+      "area:compose"
+    ],
+    "body": "## Problem\nThe object store honors `OBJECTSTORE_ACCESS_KEY`/`OBJECTSTORE_SECRET_KEY` (`compose.yaml:97-98`), and so do `objectstore-init` (`118-119`) and the gateway blog media settings (`189-190`). Other clients hardcode `mlaiops` / `mlaiops-local-secret`:\n- mlflow `compose.yaml:140-141`\n- storage-proxy `252-253`\n- pipeline-runner `304-305`\n- serving-manager `334-335`\n- jupyter `447-448`\n- ide `501-502`\n\nIf you set the documented variables, these services fail with S3 403 errors. The Postgres password has no variable at all. It is literal in `POSTGRES_PASSWORD` (`19`) and in six connection strings (`136`, `159`, `217`, `261`, `408`, `454`).\n\n## Proposal\n- Add `POSTGRES_PASSWORD` (default `mlaiops-local`) and build every URL from it.\n- Define `x-objectstore-credentials` and `x-database-url` extension fields, and reference them from each service.\n\n## Acceptance criteria\n- [ ] The literal `mlaiops-local-secret` appears at most once in `compose.yaml` (as the default).\n- [ ] A test renders `compose.yaml` with overridden `OBJECTSTORE_*` and `POSTGRES_PASSWORD`. It asserts that every `AWS_ACCESS_KEY_ID`, `S3_ACCESS_KEY` and `DATABASE_URL` uses the override.\n- [ ] `scripts/demo-smoke.sh` passes against a stack started with non-default credentials."
+  },
+  {
+    "title": "Fix log-exporter secrets mount that resolves outside the repository",
+    "labels": [
+      "bug",
+      "P2",
+      "area:compose"
+    ],
+    "body": "## Problem\n`compose.yaml:227` mounts `../config/secrets:/run/kionga-secrets:ro`. Compose resolves relative paths against the directory that holds `compose.yaml` (the deploy repo root). The mount therefore points at `<KIONGA_SRC>/config/secrets`, not at this repo's `config/secrets/`, which is the directory documented in `config/secrets/README` and in the comment at `compose.yaml:207`. Docker silently creates an empty directory, so the `KIONGA_LOG_EXPORT_*_FILE` secrets are never found.\n\n## Proposal\nChange the source to `./config/secrets`.\n\n## Acceptance criteria\n- [ ] `docker compose --profile log-export config --format json` shows a bind source that ends in `deploy/config/secrets`.\n- [ ] A test in `tests/test_local_bootstrap.py` asserts that the resolved source equals `ROOT / 'config/secrets'`.\n- [ ] With a file at `config/secrets/es-password`, the log exporter reads it (verified with the `log-export-es` profile)."
+  },
+  {
+    "title": "Persist Kafka data in a named volume with a fixed cluster ID",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:compose"
+    ],
+    "body": "## Problem\nThe `kafka` service (`compose.yaml:42-59`) has no volume. The `apache/kafka` image writes its KRaft metadata and logs inside the container filesystem, so any recreate loses every topic and message. Recreates happen on `up --force-recreate`, on an image bump, or on a restart under the legacy public overlay (`compose.public.yaml:57`). Lost data includes the audit stream `mlaiops.audit.operations` and the command topics created by `scripts/local-topics.sh:7-21`.\n\n## Proposal\n- Add a `kafka-data` volume.\n- Set `KAFKA_LOG_DIRS` to the mounted path and a fixed `CLUSTER_ID` so the KRaft storage format survives restarts.\n\n## Acceptance criteria\n- [ ] `kafka-data` is declared under `volumes:` and mounted by `kafka`. A test asserts this.\n- [ ] After `docker compose up -d --force-recreate kafka`, `kafka-topics.sh --list` still shows the topics from `local-topics.sh`.\n- [ ] A message produced before the recreate can be consumed after it."
+  },
+  {
+    "title": "Pin every third-party image by digest and automate digest updates",
+    "labels": [
+      "security",
+      "P2",
+      "area:compose"
+    ],
+    "body": "## Problem\nOnly the object store is pinned by digest (`compose.yaml:91`). Other images use floating or mutable tags:\n- `prefecthq/prefect:3-latest` (`compose.yaml:280`). This can jump schema versions on top of the persisted `prefect-data` volume.\n- `langfuse/langfuse:2` (`257`) and `pgvector/pgvector:pg16` (`16`)\n- `caddy:2.8` (`compose.public.yaml:11`)\n- Tag-only images: `redis:7.4.5-alpine` (`32`), `apache/kafka:3.9.1` (`43`), `karapace:6.1.4` (`65`), elasticsearch (`233`), opensearch (`240`), `dexidp/dex:v2.41.1` (`compose.public.yaml:25`)\n- `FROM ghcr.io/mlflow/mlflow:v3.1.1` (`mlflow/Dockerfile:1`)\n\nTwo stacks built a week apart can therefore differ, and a retagged upstream image changes what runs.\n\n## Proposal\n- Use the `tag@sha256:` form everywhere.\n- Add `renovate.json` with `docker:pinDigests` so updates arrive as reviewable PRs.\n\n## Acceptance criteria\n- [ ] A test asserts that every `image:` in `compose.yaml` and `compose.public.yaml`, and every `FROM` in `mlflow/Dockerfile`, matches `@sha256:[a-f0-9]{64}`. This extends `test_object_store_is_pinned_rustfs_and_every_client_uses_it`.\n- [ ] Renovate config is committed and opens digest PRs.\n- [ ] `make local-up` and the Pressure workflow pass with the pinned images."
+  },
+  {
+    "title": "Add healthchecks to every long-running Compose service and gate dependents on them",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:compose"
+    ],
+    "body": "## Problem\nOnly 8 services in `compose.yaml` define a healthcheck. These have none: gateway (`149-192`), feature-gateway (`194`), storage-proxy (`243`), langfuse (`256`), pipeline-runner (`292`), serving-manager (`320`), realtime-processor (`338`), trace-proxy (`373`) and agent-runtime (`388`).\n\nAs a result, dependents can only wait for `service_started`:\n- jupyter waits on gateway (`436`)\n- feature-materializer (`362-364`), realtime-processor (`346-347`) and agent-runtime (`399`)\n- caddy waits on gateway (`compose.public.yaml:22`)\n\nReadiness is reimplemented with ad hoc loops in `scripts/local-up.sh:211-232`, `public-up.sh:44-50` and `.github/workflows/pressure.yml:48-59`.\n\n## Proposal\n- Add healthchecks that use the endpoints the Helm chart already probes (`helm/kionga/values.yaml`: `/api/v1/health`, `/healthz`).\n- Switch dependents to `service_healthy`.\n- Use `docker compose up --wait` in the scripts and in CI.\n\n## Acceptance criteria\n- [ ] A test asserts that every non-profile service without `restart: \"no\"` has a `healthcheck`.\n- [ ] `docker compose up -d --wait` returns only after the gateway is healthy.\n- [ ] The bespoke wait loop in `pressure.yml` is replaced with `--wait`, and the workflow passes."
+  },
+  {
+    "title": "Set memory, CPU and PID limits for local stack services",
+    "labels": [
+      "reliability",
+      "P3",
+      "area:compose"
+    ],
+    "body": "## Problem\n`compose.yaml` sets no `mem_limit`, `cpus` or `pids_limit` on any service, while `vm/compose.yaml:12-14` does. The Kafka JVM, Langfuse, MLflow and the Jupyter workbench can use all of Docker Desktop's memory, and an OOM on the host takes down Postgres with them. `scripts/local-up.sh:43-52` warns about disk space but says nothing about memory.\n\n## Proposal\n- Add an `x-limits` anchor with per-service values that can be overridden through environment variables (for example `KIONGA_MEM_KAFKA`).\n- Document the minimum host RAM in the README.\n\n## Acceptance criteria\n- [ ] Every service in `compose.yaml` has `mem_limit` and `pids_limit`. A test asserts this.\n- [ ] The Pressure workflow runs smoke, stress and k6 with the limits applied and passes.\n- [ ] The README states the required host RAM for the default and `ide` profiles."
+  },
+  {
+    "title": "Split the local stack into Compose profiles",
+    "labels": [
+      "dx",
+      "P3",
+      "area:compose"
+    ],
+    "body": "## Problem\nEvery service except `ide` and the log-export targets starts by default. That includes the demo workers `realtime-processor` (`compose.yaml:338`) and `feature-materializer` (`358`), the privileged `jupyter` (`467-469`) and two Docker-socket consumers (`315-317`, `325-327`). CI works around this with `grep -vxE 'jupyter|ide'` (`.github/workflows/pressure.yml:45`).\n\n## Proposal\n- Add profiles: `core` (data services and gateway), `ml` (mlflow, prefect, pipeline-runner, serving-manager), `agents` (agent-runtime, trace-proxy, langfuse), `workbench` (jupyter) and `demo` (realtime-processor, feature-materializer).\n- `make local-up` keeps everything enabled by default and accepts `PROFILES=`.\n\n## Acceptance criteria\n- [ ] `docker compose --profile core up -d --wait` brings up a healthy gateway.\n- [ ] `pressure.yml` selects profiles instead of filtering with grep.\n- [ ] A test asserts that every service belongs to a known profile or to the core set.\n- [ ] The README documents each profile."
+  },
+  {
+    "title": "Remove SYS_ADMIN, unconfined AppArmor and owner DB credentials from the default workbench",
+    "labels": [
+      "security",
+      "P2",
+      "area:compose"
+    ],
+    "body": "## Problem\nThe `jupyter` service runs arbitrary user code, yet it is configured with:\n- `cap_add: [SYS_ADMIN]`, `/dev/fuse` and `apparmor:unconfined` (`compose.yaml:467-469`)\n- the platform owner `DATABASE_URL` (`454`)\n- static object-store keys that cover every bucket (`447-451`)\n\n`compose.public.yaml:90` keeps the same container running on public VMs. Notebook code can therefore modify platform tables, and the container has a much larger escape surface than it needs.\n\n## Proposal\n- Make the FUSE mounts opt-in (`KIONGA_WORKBENCH_FUSE=1` or a `workbench-fuse` profile). Alternatively, run the mount in a sidecar that shares a volume.\n- Give the workbench a dedicated Postgres role (created in `postgres/init.sql`) without DDL or write access to platform schemas.\n- Give it an object-store key scoped to user buckets.\n\n## Acceptance criteria\n- [ ] The default `docker compose config` shows `jupyter` with no `cap_add` and no `security_opt` override.\n- [ ] The workbench `DATABASE_URL` user cannot `INSERT` into platform tables (integration test).\n- [ ] Workbench smoke checks still pass, and FUSE mounts work when opted in."
+  },
+  {
+    "title": "Make vm/up.py upgrades in-place with rollback to the last good digest",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:vm"
+    ],
+    "body": "## Problem\n`vm/up.py:67` runs `up -d ... --force-recreate`. Every deploy therefore recreates Caddy, dropping TLS connections, even when only the gateway digest changed. If readiness fails, the script exits with `No automatic data rollback was attempted` (`vm/up.py:78`). The previous image digests are never recorded, so the operator has to reconstruct them by hand.\n\n## Proposal\n- Drop `--force-recreate`, so Compose recreates only changed services.\n- After a 200 from `/api/v1/ready`, write `/var/lib/kionga/last-good.json` containing the digests.\n- On readiness failure, re-run `up` with the last-good digests. Add an explicit `--rollback` flag.\n- Print the digest diff before applying.\n\n## Acceptance criteria\n- [ ] Unit tests with `subprocess.run` mocked show that a failed readiness check triggers a second `up` with the previous images.\n- [ ] The state file is written only after readiness succeeds (test).\n- [ ] `--force-recreate` is no longer passed (test).\n- [ ] The VM docs describe `--rollback`."
+  },
+  {
+    "title": "Add log rotation and healthchecks to vm/compose.yaml",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:vm"
+    ],
+    "body": "## Problem\n`vm/compose.yaml` sets no `logging:` options. Docker's default `json-file` driver grows without bound, which on a single VM eventually fills the disk that Caddy's certificate store (`caddy-data`) lives on. The gateway has no Compose healthcheck: only Caddy probes it (`vm/Caddyfile:8-12`). `caddy` uses `depends_on: [gateway]` (`vm/compose.yaml:49`), so it starts before the gateway is ready, and Caddy itself has no healthcheck.\n\n## Proposal\n- Add an `x-logging` anchor (`json-file`, `max-size: 10m`, `max-file: 5`) to both services.\n- Add a gateway healthcheck. The gateway runs as `65532` with a read-only root filesystem and may have no shell, so this may need a `healthcheck` subcommand from the platform image.\n- Change `depends_on` to `condition: service_healthy`.\n\n## Acceptance criteria\n- [ ] `docker compose -f vm/compose.yaml config` shows logging options on every service. A test in `tests/test_production_deploy.py` asserts this.\n- [ ] The gateway has a `healthcheck`, and caddy depends on `service_healthy`.\n- [ ] `vm/up.py --validate-only` still passes."
+  },
+  {
+    "title": "Harden Caddy edges with security headers, HSTS scope and request limits",
+    "labels": [
+      "security",
+      "P2",
+      "area:edge"
+    ],
+    "body": "## Problem\n- `vm/Caddyfile:7` sets HSTS with `max-age=31536000` only: no `includeSubDomains`, and no `X-Content-Type-Options`, `Referrer-Policy` or frame protection.\n- Neither Caddyfile limits request body size or strips the `Server` header.\n- `caddy/Caddyfile:3-5` sets no HSTS at all and leaves the Caddy admin API enabled. `vm/Caddyfile:3` disables it.\n\n## Proposal\n- Add a shared `(security_headers)` snippet: HSTS `max-age=63072000; includeSubDomains`, `X-Content-Type-Options nosniff`, `Referrer-Policy strict-origin-when-cross-origin`, `-Server`.\n- Add `request_body { max_size <configurable> }`.\n- Add `admin off` to `caddy/Caddyfile`.\n\n## Acceptance criteria\n- [ ] `caddy validate` runs in CI for both Caddyfiles, using a digest-pinned Caddy image.\n- [ ] `scripts/verify-production.py` `check_http` asserts that HSTS and `nosniff` are present on the origin response.\n- [ ] A test asserts that both Caddyfiles import the headers snippet."
+  },
+  {
+    "title": "Verify cosign signatures and provenance before deploying images",
+    "labels": [
+      "security",
+      "P2",
+      "area:supply-chain"
+    ],
+    "body": "## Problem\n`vm/up.py:19` checks only that image references match `@sha256:<64 hex>`. `vm/deployment.example.json:5` asks for a `VERIFIED_DIGEST`, but nothing verifies one. The Helm guard (`helm/kionga/templates/config.yaml:4-8`) is also a regex check. `scripts/deploy-kubernetes.sh:20-39` renders and installs without checking signatures. No SBOM or provenance attestation is consumed anywhere in the repo, so a digest copied from a compromised registry or a typo-squatted repository deploys without complaint.\n\n## Proposal\n- In `vm/up.py` and `deploy-kubernetes.sh`, run `cosign verify` for each image. Use `--certificate-identity-regexp` bound to the kiongahq release workflows and `--certificate-oidc-issuer https://token.actions.githubusercontent.com`.\n- Run `cosign verify-attestation --type slsaprovenance` and `--type spdxjson` as well.\n- Optionally add a chart toggle `imageVerification.enabled` that renders a sigstore policy-controller `ClusterImagePolicy`.\n\n## Acceptance criteria\n- [ ] `vm/up.py` refuses an image whose verification fails. Unit test with cosign mocked.\n- [ ] `deploy-kubernetes.sh` verifies every image in the rendered manifests before `helm upgrade`.\n- [ ] Skipping verification needs an explicit `--insecure-skip-verify` flag that prints a warning.\n- [ ] The docs list the expected signer identity."
+  },
+  {
+    "title": "Pin GitHub Actions to commit SHAs and add workflow linting",
+    "labels": [
+      "security",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\nEvery `uses:` reference is a mutable tag:\n- `actions/checkout@v4`, `actions/setup-python@v5`, `azure/setup-helm@v4` (`.github/workflows/ci.yml:22,25,27`)\n- `grafana/setup-k6-action@v1` (`.github/workflows/pressure.yml:64`)\n\nIf a third-party tag is retagged, its code runs in the next main push or nightly. The `deploy` job in `ci.yml` also has no `timeout-minutes`.\n\n## Proposal\n- Pin each action to a 40-character SHA, with the version in a comment.\n- Add `.github/dependabot.yml` for `github-actions`.\n- Run `actionlint` and `zizmor` in CI.\n- Add `timeout-minutes` to every job.\n\n## Acceptance criteria\n- [ ] Every `uses:` matches `@[0-9a-f]{40}`. A test or CI step enforces this.\n- [ ] Dependabot config is committed.\n- [ ] actionlint runs on PRs and passes."
+  },
+  {
+    "title": "Make kind tooling reproducible: pin operator charts, verify Helm, install kubectl",
+    "labels": [
+      "reliability",
+      "P3",
+      "area:kind"
+    ],
+    "body": "## Problem\n- `scripts/bootstrap-k8s-tools.sh:35-39` downloads the Helm tarball without verifying its checksum.\n- `scripts/kind-up.sh:12` requires `kubectl`, but the bootstrap script does not install it.\n- `scripts/kind-up.sh:32-37` installs `cnpg/cloudnative-pg`, `strimzi/strimzi-kafka-operator` and `metrics-server` without `--version`, so every run gets whatever is latest. The fidelity cluster changes underneath developers even though the kind node image is pinned by digest (`kind-up.sh:7`).\n\n## Proposal\n- Add `CNPG_CHART_VERSION`, `STRIMZI_CHART_VERSION` and `METRICS_SERVER_CHART_VERSION` variables and pass them with `--version`.\n- Verify the Helm tarball against `get.helm.sh/<archive>.sha256sum`.\n- Install a pinned, checksum-verified `kubectl` into `.tools.nosync/bin`.\n\n## Acceptance criteria\n- [ ] The bootstrap script fails on a checksum mismatch (test with a tampered archive).\n- [ ] `helm list -A` after `make kind-up` shows the pinned chart versions.\n- [ ] `make kind-up` succeeds on a machine without kubectl preinstalled."
+  },
+  {
+    "title": "Make kind-up install the Helm chart and retire the config/deploy manifests",
+    "labels": [
+      "refactor",
+      "P2",
+      "area:k8s"
+    ],
+    "body": "## Problem\n`scripts/kind-up.sh:54-62` applies `config/deploy` and `config/network` and then patches images with `kubectl set image`. The Helm chart is never installed into any cluster by repo tooling. Those manifests differ from what production runs:\n- `ghcr.io/mlaiops/*:latest` images (`config/deploy/operator.yaml:17,21`; `platform-services.yaml:22,65,85,106`; `integration-worker.yaml:17`)\n- `app:` labels instead of the chart's `app.kubernetes.io/component`\n- example OIDC values (`platform-services.yaml:34-36`) and no `readOnlyRootFilesystem` on the gateway (`:40`)\n- a cluster-wide `ClusterRole` with secrets CRUD (`config/rbac/operator.yaml:7-45`), where the chart scopes RBAC to the workspace namespace (`helm/kionga/templates/rbac.yaml:1-24`)\n- gateway egress to any namespace (`config/network/platform-allow.yaml:10-16`)\n\nThe local fidelity path therefore tests a different deployment than the one that ships.\n\n## Proposal\n- Add `helm/kind.values.yaml`.\n- Push locally built images to a kind-attached registry (`localhost:5001`) so they get real digests, then `helm upgrade --install` the chart.\n- Delete `config/deploy`, `config/rbac` and `config/network` once e2e passes.\n\n## Acceptance criteria\n- [ ] `kind-up.sh` installs `helm/kionga` and no longer applies `config/deploy`.\n- [ ] `scripts/e2e-kind.sh` passes against the chart release (deployment names `kionga-*`).\n- [ ] No `ClusterRole` grants secrets access in the kind install.\n- [ ] `config/deploy`, `config/rbac` and `config/network` are removed, and the README is updated."
+  },
+  {
+    "title": "Run kind end-to-end tests in CI for chart and manifest changes",
+    "labels": [
+      "testing",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\n`.github/workflows/ci.yml:29-33` runs only pytest, `helm lint`, `bash -n` and `py_compile`. `scripts/e2e-kind.sh` (`make test-e2e-kind`) never runs in CI. The chart tests only check `helm template` output (`tests/test_production_deploy.py:85-94`). As a result, these failures go undetected:\n- probe path mistakes\n- Pod Security `restricted` rejections\n- NetworkPolicy blocking\n- RBAC denials\n\nThe Kubernetes pipeline executor is described as `not yet validated on a live cluster` (`helm/kionga/values.yaml:122-123`).\n\n## Proposal\nAdd a CI job, after the kind-up refactor, that creates a kind cluster with a NetworkPolicy-enforcing CNI, installs the chart and runs `e2e-kind.sh`. Add a step with `pipelineExecutor.kubernetes=true` that runs one pipeline Job.\n\n## Acceptance criteria\n- [ ] The job runs on PRs that touch `helm/**`, `config/**` or `scripts/*kind*` and is a required check.\n- [ ] On failure it uploads `kubectl get events -A` and pod logs as artifacts.\n- [ ] A pipeline Job created through the gateway reaches `Complete` in the test.\n- [ ] Total runtime is under 30 minutes, enforced with `timeout-minutes`."
+  },
+  {
+    "title": "Add shellcheck and kubeconform to CI and stop masking script failures",
+    "labels": [
+      "testing",
+      "P3",
+      "area:ci"
+    ],
+    "body": "## Problem\nCI checks shell scripts only with `bash -n` (`.github/workflows/ci.yml:32`), and nothing runs shellcheck, even though `scripts/local-up.sh:161,163` already carries shellcheck directives. Several failures are swallowed:\n- `public-up.sh:41` ignores topic creation failures with `|| true`.\n- `scripts/workspace.sh:37` uses `&& ... || true`, which hides a failed submodule init.\n- `scripts/demo-smoke.sh:11` and `scripts/stress-test.sh:15` use `set -uo pipefail` without `-e`, and this is not documented.\n\nRendered chart manifests and the raw YAML under `config/` are never validated against Kubernetes schemas.\n\n## Proposal\n- Run `shellcheck -x` on `public-up.sh` and `scripts/*.sh`.\n- Run `kubeconform -strict` with CRD schemas (CNPG, External Secrets, Prometheus Operator) on `helm template` output for `production.example.yaml` and each provider overlay.\n- Fix the masked failures, and document the intentional no-`-e` mode in the smoke scripts.\n\n## Acceptance criteria\n- [ ] CI runs shellcheck and kubeconform, and both pass.\n- [ ] `workspace.sh` exits non-zero when the submodule update fails (test with a broken submodule URL).\n- [ ] Each provider overlay renders to schema-valid manifests."
+  },
+  {
+    "title": "Add values.schema.json to the Helm chart",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:helm"
+    ],
+    "body": "## Problem\n`helm/kionga/values.yaml` has no schema, so a mistyped key (for example `gatewayAutoscalling` or `components.gateway.replica`) is silently ignored. All validation is done with ad hoc `fail` calls in `helm/kionga/templates/config.yaml:1-18`. `components.<name>.resources` is read in `workloads.yaml:63` but is undocumented. `externalSecrets.targets` and `workspaceQuota` accept any shape.\n\n## Proposal\nAdd a draft-07 `values.schema.json` with:\n- `additionalProperties: false` on known objects\n- a digest pattern for `images.*`\n- an enum `[SecretStore, ClusterSecretStore]` for `storeKind`\n- `ingress.host` required when ingress is enabled\n- typed `components.*`\n\nKeep cross-field checks in `config.yaml`.\n\n## Acceptance criteria\n- [ ] `helm lint` fails on an unknown top-level key and on a non-digest image.\n- [ ] A parametrized test in `tests/test_production_deploy.py` covers at least three invalid values files.\n- [ ] `production.example.yaml` combined with each `helm/providers/*.example.yaml` passes."
+  },
+  {
+    "title": "Expose per-component resources, scheduling and priority values in the chart",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:helm"
+    ],
+    "body": "## Problem\nAll six components share one `resources` block (`helm/kionga/values.yaml:78-80`: 100m/128Mi requests, 1 CPU/512Mi limits) unless an undocumented per-component override is set (`workloads.yaml:63`). The gateway autoscales on CPU percentage (`edge.yaml:59-62`), so its requests drive scaling. The trace-proxy holds long LLM streams, and the operator runs an informer cache. The chart also has no `nodeSelector`, `tolerations`, `affinity`, `priorityClassName` or `podAnnotations` values, so operators cannot pin the control plane to a system node pool or keep it off GPU nodes.\n\n## Proposal\n- Add `components.<name>.{resources,nodeSelector,tolerations,affinity,priorityClassName,podAnnotations}`, with global defaults under `podDefaults`.\n- Optionally render a `PriorityClass`.\n\n## Acceptance criteria\n- [ ] A rendering test sets per-component values and asserts them on each Deployment.\n- [ ] With no overrides, rendered output matches the current defaults.\n- [ ] Production example values set explicit gateway and trace-proxy resources."
+  },
+  {
+    "title": "Add a preStop delay so rolling updates do not drop in-flight requests",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:helm"
+    ],
+    "body": "## Problem\n`helm/kionga/templates/workloads.yaml:20-21` uses `maxUnavailable: 0, maxSurge: 1` and `terminationGracePeriodSeconds: 45` (`:31`), but containers have no `lifecycle.preStop`. When a pod terminates, SIGTERM races endpoint removal in the ingress controller and kube-proxy. Requests routed in that window fail with 502s during every `helm upgrade` and every HPA scale-down (`edge.yaml:56-57`). The images run as `65532` with a read-only root filesystem and may not include `sleep`.\n\n## Proposal\n- Use the native `lifecycle.preStop.sleep.seconds` (configurable, default 10).\n- Raise `kubeVersion` in `Chart.yaml:7` to `>=1.30.0-0`, where the sleep action is enabled by default, or gate the feature on capabilities.\n- Add `minReadySeconds`.\n\n## Acceptance criteria\n- [ ] Rendered Deployments include `preStop.sleep`, and grace period exceeds sleep plus drain time. A test asserts this.\n- [ ] A k6 run during `helm upgrade` in kind shows `http_req_failed` equal to 0. This is covered by the upgrade test issue.\n- [ ] `Chart.yaml` `kubeVersion` matches the feature used."
+  },
+  {
+    "title": "Autoscale worker components with KEDA and tune gateway HPA behavior",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:autoscaling"
+    ],
+    "body": "## Problem\nOnly the gateway has an autoscaler (`helm/kionga/templates/edge.yaml:46-63`). It uses CPU only and defines no `scaleUp` policy. The `integration-worker` that drains Kafka lifecycle commands is fixed at 2 replicas (`values.yaml:54-59`), and its only signal is the `KiongaWorkerPollStale` alert (`monitoring.yaml:47-51`). `trace-proxy`, `feature-gateway` and `storage-proxy` are also fixed at 2. A burst of agent traffic or command backlog therefore queues instead of scaling out.\n\n## Proposal\n- Generalize `gatewayAutoscaling` into `autoscaling.<component>`, keeping backward compatibility.\n- Support `type: hpa` (CPU and memory targets, scaleUp and scaleDown behavior) or `type: keda`.\n- For `type: keda`, render a `ScaledObject` with a Prometheus trigger on a worker lag metric, or a Kafka trigger where brokers are reachable.\n- Omit `replicas` when a component is autoscaled, as `workloads.yaml:15-17` already does for the gateway.\n\n## Acceptance criteria\n- [ ] Rendering tests cover HPA and KEDA modes for the integration worker.\n- [ ] `replicas` is absent from autoscaled Deployments.\n- [ ] The minimum replica count of 2 is still enforced (`config.yaml:12-14`).\n- [ ] Docs describe the KEDA prerequisite and the lag metric."
+  },
+  {
+    "title": "Document and template GPU and burst node pools for EKS, GKE and AKS",
+    "labels": [
+      "docs",
+      "P3",
+      "area:k8s"
+    ],
+    "body": "## Problem\nThe `KiongaWorkspace` CRD accepts `gpus` and `gpuType` (`config/crd/mlaiops.io_kiongaworkspaces.yaml:40-41`), but the provider overlays (`helm/providers/eks.example.yaml:1-4`, `gke.example.yaml`, `aks.example.yaml`) set only `storageClass` and the ingress class. Nothing in the repo provides:\n- a Karpenter `NodePool`\n- a GPU taint or toleration\n- an NVIDIA device plugin prerequisite\n- a `requests.nvidia.com/gpu` quota in `workspaceQuota` (`values.yaml:107-112`)\n\n`scripts/cloud-preflight.py` does not check GPU capacity.\n\n## Proposal\n- Add `helm/providers/eks-karpenter.example.yaml` with `system`, `workloads` and `gpu` NodePools, tainting the GPU pool with `nvidia.com/gpu`.\n- Add equivalent GKE and AKS node pool examples.\n- Add a GPU quota key.\n- Add `cloud-preflight.py --expect-gpu`, which checks allocatable `nvidia.com/gpu` and the device plugin DaemonSet.\n\n## Acceptance criteria\n- [ ] The example manifests pass kubeconform.\n- [ ] A preflight test with mocked nodes fails when no node advertises `nvidia.com/gpu`.\n- [ ] A rendering test shows the GPU quota key in the workspace `ResourceQuota`.\n- [ ] A docs page explains how to scale node pools for workspaces."
+  },
+  {
+    "title": "Scope NetworkPolicy ingress and egress per component",
+    "labels": [
+      "security",
+      "P2",
+      "area:helm"
+    ],
+    "body": "## Problem\n`helm/kionga/templates/network.yaml:7-8` selects every release pod with a single policy, and `networkPolicy.externalEgress` (`:28-30`) applies to all of them. In `helm/production.example.yaml:45-47`, every component, storage-proxy and trace-proxy included, may reach the database, Redis and Kubernetes API ports (5432, 6379, 6443). Two other gaps:\n- Egress to the workspace namespace (`network.yaml:23-27`) has no port restriction.\n- Ingress from the workspace namespace (`:14-17`) opens 8083 and 8084 on every pod, including the operator.\n\n## Proposal\n- Add `components.<name>.networkPolicy.{egress,ingressPorts}` and render one policy per component.\n- Keep the DNS rule.\n- Restrict workspace egress to the workbench ports (8080, 8081, 8888).\n\n## Acceptance criteria\n- [ ] A rendering test asserts that storage-proxy has no 5432 egress and that the operator accepts no ingress from the workspace namespace.\n- [ ] In kind with an enforcing CNI, a test shows that the storage-proxy pod cannot open a TCP connection to Postgres.\n- [ ] `production.example.yaml` is updated to the per-component form."
+  },
+  {
+    "title": "Create and harden the pipeline executor namespace and pin Pod Security levels",
+    "labels": [
+      "security",
+      "P2",
+      "area:k8s"
+    ],
+    "body": "## Problem\nWith `pipelineExecutor.kubernetes: true`, user pipeline code runs as Jobs, but the chart only creates a Role (`helm/kionga/templates/rbac.yaml:102-127`). `values.yaml:120-123` leaves the namespace, NetworkPolicy and quota to the operator, so user code may run without default-deny, Pod Security or a quota. Separately:\n- The release (control) namespace gets no Pod Security labels.\n- The workspace namespace pins `pod-security.kubernetes.io/enforce-version: latest` (`config.yaml:34`), so a cluster upgrade can change enforcement without warning.\n\n## Proposal\n- When `pipelineExecutor.kubernetes` is true, render the pipeline Namespace (with `helm.sh/resource-policy: keep`) with:\n  - Pod Security `restricted` pinned to a version\n  - a `ResourceQuota` and a `LimitRange`\n  - default-deny plus egress to the gateway, DNS and object store\n- Pin `enforce-version` to a value such as `v1.30`.\n- Have `deploy-kubernetes.sh` check that the release namespace carries the `restricted` label.\n\n## Acceptance criteria\n- [ ] A rendering test with `pipelineExecutor.kubernetes=true` finds Namespace, NetworkPolicy, ResourceQuota and LimitRange objects.\n- [ ] No rendered namespace uses `enforce-version: latest`.\n- [ ] `deploy-kubernetes.sh` fails when the release namespace lacks the label (test with kubectl mocked)."
+  },
+  {
+    "title": "Roll pods on secret rotation and validate ExternalSecret coverage",
+    "labels": [
+      "security",
+      "P2",
+      "area:secrets"
+    ],
+    "body": "## Problem\n- The pod-template checksum covers only `.Values.config` (`helm/kionga/templates/workloads.yaml:28`). Rotating a Secret does not restart pods, and nothing guarantees that apps re-read `*_FILE` paths.\n- The `ExternalSecret` `refreshInterval` is hardcoded to `1h` (`edge.yaml:72`).\n- With `externalSecrets.enabled`, nothing checks that each component with `secrets` (`values.yaml:47,65,71`) has a matching target. A missing target only appears as a pod stuck in `ContainerCreating`.\n- `secretNames` lists operator, integration-worker and trace-proxy Secrets (`values.yaml:36-37,40`) that are never mounted.\n- `KIONGA_CREDENTIAL_KEY` (`.env.example:81-83`) has no documented rotation or re-encryption path.\n\n## Proposal\n- Add a template `fail` when a component has `secrets` and `externalSecrets.targets` lacks its `secretNames` entry.\n- Make `refreshInterval` configurable.\n- Add optional Reloader annotations (`secret.reloader.stakater.com/reload`).\n- Remove the unused `secretNames` entries.\n- Write a rotation runbook per secret, including a dual-key window for the credential key.\n\n## Acceptance criteria\n- [ ] Rendering fails when the `kionga-gateway` target is missing (test).\n- [ ] With reloader enabled, each Deployment carries the annotation for its Secret (test).\n- [ ] A rotation runbook is committed and linked from the README."
+  },
+  {
+    "title": "Scrape every component and add SLO alert rules with promtool tests",
+    "labels": [
+      "observability",
+      "P2",
+      "area:observability"
+    ],
+    "body": "## Problem\n`helm/kionga/templates/monitoring.yaml:2` creates ServiceMonitors only for gateway, operator and integration-worker. feature-gateway, storage-proxy and trace-proxy expose only `http` (`workloads.yaml:91-92`) and are not scraped. The `PrometheusRule` has two alerts (`monitoring.yaml:42-51`). Nothing alerts on:\n- 5xx ratio or p95 latency, although the k6 SLOs exist (`tests/load/gateway.js:86-92`)\n- pod restarts or HPA at max replicas\n- ExternalSecret sync failures or CNPG backup failures\n- TLS expiry, which `scripts/verify-production.py:106-113` checks only once at acceptance time\n\n## Proposal\n- Expose `/metrics` on all components and render one ServiceMonitor per component.\n- Add alert rules that mirror the k6 SLOs, each with `runbook_url`.\n- Add `promtool test rules` unit tests.\n\n## Acceptance criteria\n- [ ] Six ServiceMonitors are rendered. Update the count in `test_managed_chart_security_and_availability`.\n- [ ] CI runs `promtool check rules` and `promtool test rules` on the rendered rules.\n- [ ] Every alert has `severity` and `runbook_url`."
+  },
+  {
+    "title": "Ship Grafana dashboards, an OTel collector and log aggregation",
+    "labels": [
+      "observability",
+      "P3",
+      "area:observability"
+    ],
+    "body": "## Problem\nThe repo contains no dashboards, OpenTelemetry collector config, or Loki/Promtail setup. The Compose stack exposes no metrics pipeline. Logs are available only through `docker compose logs` or the optional Elasticsearch/OpenSearch exporter profiles (`compose.yaml:205-241`). The chart sets `METRICS_PORT` only for the gateway (`workloads.yaml:67-69`) and passes no `OTEL_EXPORTER_OTLP_ENDPOINT`.\n\n## Proposal\n- Add `helm/kionga/dashboards/*.json`, rendered as ConfigMaps labeled `grafana_dashboard: \"1\"` when `monitoring.dashboards.enabled`.\n- Add `monitoring.otlpEndpoint`, passed to every component.\n- Add an `observability` Compose profile with otel-collector, Prometheus, Grafana and Loki, all pinned by digest and provisioned with the same dashboards.\n\n## Acceptance criteria\n- [ ] Dashboard ConfigMaps render with the sidecar label (test).\n- [ ] `docker compose --profile observability up -d --wait` shows the gateway target `UP` in Prometheus (Pressure workflow step).\n- [ ] Dashboard JSON passes a lint test (valid JSON, uid set, datasource templated)."
+  },
+  {
+    "title": "Add a scheduled Postgres point-in-time restore drill",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:backup"
+    ],
+    "body": "## Problem\n`config/backup/postgres.yaml` defines a CNPG `Cluster` with `barmanObjectStore` and a daily `ScheduledBackup`, but nothing proves a restore works:\n- There is no restore or `bootstrap.recovery` example.\n- No `wal`/`data` encryption or compression is configured (`:11-17`).\n- `imageName` is not pinned.\n- It lives in `mlaiops-system` (`:5`), while the chart and acceptance tooling use `kionga-system` (`scripts/verify-production.py:166`).\n- Neither the chart, the README nor `deploy-kubernetes.sh` references it.\n\n`kind-up.sh:32` installs CNPG, but no test uses it.\n\n## Proposal\n- Add `config/backup/postgres-restore.example.yaml` using `bootstrap.recovery.recoveryTarget.targetTime`.\n- Add `scripts/dr-drill-postgres.sh`. It writes a marker row, records T, writes a second marker, restores to T in kind (RustFS as the barman target), and asserts that only the first marker exists.\n- Configure encryption and compression, and pin `imageName` by digest.\n\n## Acceptance criteria\n- [ ] The drill passes in a nightly workflow and reports measured restore time.\n- [ ] The manifests pin `imageName` and use the chart namespace.\n- [ ] The docs state RPO and RTO targets backed by the drill output."
+  },
+  {
+    "title": "Back up object storage and Compose volumes with a tested restore command",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:backup"
+    ],
+    "body": "## Problem\n`objectstore-init.py:35-44` creates buckets without versioning or lifecycle rules. In Compose and legacy public deployments, model artifacts (`mlaiops-models`), traces and agent bundles exist only in the `objectstore-data` volume (`compose.yaml:100`). `postgres-data`, `prefect-data` and `jupyter-data` have no backup tooling either, and the `Makefile` has no backup or restore target. A single `docker compose down -v`, as `pressure.yml:72` runs, deletes everything. For Kubernetes, the external `S3_ENDPOINT` (`helm/kionga/values.yaml:29`) comes with no guidance on versioning or replication.\n\n## Proposal\n- Enable bucket versioning in `objectstore-init.py` where the store supports it.\n- Add `make backup`: `pg_dumpall`, an S3 mirror of each bucket, and tarballs of the `prefect` and `jupyter` volumes, plus a manifest with checksums.\n- Add `make restore`.\n- Document bucket versioning and cross-region replication for production S3.\n\n## Acceptance criteria\n- [ ] An integration test runs backup, then `down -v`, then restore. `demo-smoke.sh` passes, and a registered MLflow model artifact downloads.\n- [ ] A unit test with the fake client from `test_bucket_bootstrap_is_idempotent` asserts that `put_bucket_versioning` is called.\n- [ ] Restore refuses a backup whose checksum manifest does not match."
+  },
+  {
+    "title": "Run database migrations and CRD upgrades as explicit, ordered deploy steps",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:upgrades"
+    ],
+    "body": "## Problem\nThe chart has no migration Job or hook. The gateway runs 3 replicas (`helm/kionga/values.yaml:43`) with `maxSurge: 1`, so old and new pods share the database during a rollout, and any schema change applied at startup races with old code. `vm/up.py:66-67` swaps the gateway image without taking a backup or running a migration step. CRDs are applied outside the chart: `scripts/deploy-kubernetes.sh:22-24` only checks that they exist, so there is no versioned CRD upgrade path.\n\n## Proposal\n- Add a `pre-install,pre-upgrade` hook Job that runs the gateway image's migrate command. This needs a `migrate` entrypoint from the platform repo, so coordinate with it.\n- Precede the Job with an on-demand CNPG `Backup` when enabled.\n- `deploy-kubernetes.sh --apply` runs `kubectl apply --server-side -f config/crd` before `helm upgrade`.\n- `vm/up.py` runs the migrate container before swapping the gateway.\n- Document an expand/contract migration policy.\n\n## Acceptance criteria\n- [ ] The migration hook Job renders with hook weights that order it before Deployments (test).\n- [ ] With kubectl and helm mocked, a test shows the CRD apply runs before `helm upgrade`.\n- [ ] `vm/up.py` aborts the swap if migration fails (unit test)."
+  },
+  {
+    "title": "Add a zero-downtime upgrade test from the previous release",
+    "labels": [
+      "testing",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\nNo test exercises an upgrade. Chart tests render a single version (`tests/test_production_deploy.py:85-94`). The Pressure workflow boots a fresh stack and tears it down with `down -v` (`.github/workflows/pressure.yml:41-72`). `maxUnavailable: 0` (`helm/kionga/templates/workloads.yaml:21`), the PDBs and the VM installer's swap (`vm/up.py:67`) are never tested under traffic.\n\n## Proposal\nAdd a nightly job that:\n- installs the previous chart tag and its images in kind\n- starts `k6 run -e PROFILE=smoke tests/load/gateway.js` in the background\n- runs `helm upgrade` to HEAD\n- requires k6 to report `http_req_failed` == 0\n\nAdd the same scenario for `vm/up.py` with digest A then digest B, polling continuously with curl.\n\n## Acceptance criteria\n- [ ] The nightly job fails if any request fails during the upgrade.\n- [ ] The job uploads the k6 summary and `kubectl get events`.\n- [ ] The VM upgrade scenario reports zero failed polls."
+  },
+  {
+    "title": "Pin component revisions so CI and releases are reproducible",
+    "labels": [
+      "reliability",
+      "P2",
+      "area:ci"
+    ],
+    "body": "## Problem\n`scripts/workspace.sh:30` clones each component's default branch without a ref, and CI relies on this (`.github/workflows/ci.yml:3-5`, `pressure.yml:31,40`). A merge in `platform` can break deploy CI with no change in this repo, and an older deploy commit cannot be rebuilt with the components it was tested against. `KIONGA_SDK_SOURCE=release` (`compose.yaml:7-8`) covers only the SDK.\n\n## Proposal\n- Add `components.lock`, mapping each repo to a commit SHA or tag.\n- Add `workspace.sh --locked`, which checks out the locked refs.\n- Make the CI job that runs on the lock required, and run a separate non-blocking `main` canary job.\n- Automate lock bumps with a bot PR.\n\n## Acceptance criteria\n- [ ] A test with local bare repos shows `workspace.sh --locked` checks out the exact SHAs.\n- [ ] The required CI job uses the lock.\n- [ ] The README explains how to bump the lock."
+  },
+  {
+    "title": "Add in-repo runbooks for upgrade, rollback, disaster recovery and secret rotation",
+    "labels": [
+      "docs",
+      "P2",
+      "area:docs"
+    ],
+    "body": "## Problem\n`README.md:87` and `README.md:99` link only to external docs. The repo has no runbook for:\n- VM rollback (`vm/up.py:78` states that no automatic rollback happens)\n- Postgres restore (`config/backup/postgres.yaml`)\n- escrow of `KIONGA_CREDENTIAL_KEY`, which `.env.example:81-83` says must be backed up, or losing encrypted Hub credentials\n- rotating `MLAIOPS_INTERNAL_TOKEN`, which is shared across many services in `compose.yaml` and `compose.public.yaml`\n\n`deploy-kubernetes.sh:41` asks operators to run an authenticated acceptance checklist, but the README never shows how to invoke `scripts/verify-production.py`.\n\n## Proposal\nAdd `docs/operations/{upgrade,rollback,disaster-recovery,secret-rotation,acceptance}.md`. Each should include RPO and RTO targets, ordered steps, and exact commands for the Compose, VM and Helm paths. Link them from the README.\n\n## Acceptance criteria\n- [ ] All five runbooks are committed and linked from the README.\n- [ ] Each command in the DR runbook is executed by the restore drill jobs.\n- [ ] A markdown link check runs in CI."
+  },
+  {
+    "title": "Test verify-production.py and stop it reading TLS private keys",
+    "labels": [
+      "testing",
+      "P3",
+      "area:testing"
+    ],
+    "body": "## Problem\n`scripts/verify-production.py` has no tests (nothing under `tests/` imports it), while `cloud-preflight.py` does. It has two problems:\n- `check_cluster` always fetches the `<release>-workspaces` Ingress (`:44`), so acceptance fails for valid installs with `workspaceIngress.enabled: false` (`helm/kionga/values.yaml:89`).\n- It runs `kubectl get secret -o json` on the TLS Secrets (`:48-50`). This pulls `tls.key` to the operator's machine and requires secret-read RBAC, when checking the served certificate (`check_certificate`) would be enough.\n\n## Proposal\n- Add pytest coverage with `kubectl` and `exchange` monkeypatched.\n- Make the workspace ingress check conditional (`--no-workspace-ingress`).\n- Check only Secret metadata and type (`-o jsonpath`), or rely on `check_certificate` alone.\n\n## Acceptance criteria\n- [ ] Tests cover: all checks passing, a missing PDB, an unpinned image, a replayable handoff ticket and a disabled workspace ingress.\n- [ ] No code path requests Secret `data`, asserted on the mocked kubectl arguments.\n- [ ] `--no-workspace-ingress` is documented in `--help`."
+  },
+  {
+    "title": "Add cert-manager support and hardened defaults to the Helm ingress",
+    "labels": [
+      "security",
+      "P3",
+      "area:helm"
+    ],
+    "body": "## Problem\n`helm/kionga/templates/edge.yaml:1-45` requires the TLS Secrets `kionga-tls` and `kionga-workspace-tls` to exist already, and offers no cert-manager integration. The wildcard workspace certificate needs DNS-01. `ingress.annotations` defaults to `{}` (`values.yaml:86`) and the provider overlays add none (`helm/providers/*.example.yaml`), so deployments get no HSTS, body size limit or read timeout. Without longer read timeouts, Jupyter websockets through the workspace ingress break.\n\n## Proposal\n- Add `ingress.certManager.{enabled,issuerKind,issuerName}`, which sets `cert-manager.io/cluster-issuer` on both Ingresses.\n- Ship ingress-nginx annotations in the provider overlays: HSTS, `proxy-body-size`, `proxy-read-timeout` for workspaces.\n- Document DNS-01 for the wildcard host.\n\n## Acceptance criteria\n- [ ] A rendering test with `certManager.enabled` shows the issuer annotation on both Ingresses.\n- [ ] The provider overlays include the timeout and body-size annotations, and kubeconform passes.\n- [ ] The docs describe DNS-01 setup for `*.workspaces` on each provider."
+  },
+  {
+    "title": "Bring the public overlay's Dex up to the SSO overlay: v2.46, connectors, persistent storage",
+    "labels": [
+      "security",
+      "P2",
+      "area:edge"
+    ],
+    "body": "## Problem\n`compose.public.yaml` still runs `ghcr.io/dexidp/dex:v2.41.1` by tag with `dex/config.yaml`, a static password database and a comment telling operators to swap connectors by hand. The local SSO overlay (`compose.sso.yaml`, `sso/dex.yaml`) now runs Dex v2.46.0 pinned by digest with an LDAP connector, commented SAML/GitHub/Google/Entra/OIDC examples, and gateway settings for provider buttons and group-to-role mapping. Both overlays use memory storage, so signing keys and sessions reset on every Dex restart.\n\n## Proposal\n- Use one Dex config template for both overlays, with connectors chosen through environment variables.\n- Pin Dex by digest in `compose.public.yaml`, and give it SQLite storage on a named volume (or Postgres).\n- Pass `KIONGA_SSO_PROVIDERS`, `KIONGA_SSO_GROUP_ROLES` and `KIONGA_SSO_SINGLE_TENANT` to the public gateway.\n\n## Acceptance criteria\n- [ ] `compose.public.yaml` pins Dex by digest and mounts persistent storage; a test asserts both.\n- [ ] Restarting Dex keeps existing gateway sessions valid (keys persist).\n- [ ] `tests/test_sso_overlay.py` checks run against the public overlay too."
+  },
+  {
+    "title": "Add Dex and SSO settings to the Helm chart",
+    "labels": [
+      "enhancement",
+      "P2",
+      "area:helm"
+    ],
+    "body": "## Problem\nThe chart (`helm/kionga`) takes OIDC settings as plain gateway config but provides no way to deploy Dex or to set `KIONGA_SSO_PROVIDERS`, `KIONGA_SSO_GROUP_ROLES`, `KIONGA_SSO_SINGLE_TENANT` and `KIONGA_LOCAL_LOGIN`. Teams on Kubernetes must hand-write Dex manifests and keep its static client secret in step with the gateway's `OIDC_CLIENT_SECRET`.\n\n## Proposal\n- Add an optional `sso.dex` block: deploy the upstream Dex chart as a dependency (or document it as a prerequisite) with Kubernetes CRD storage, connectors from values, and secrets from External Secrets.\n- Add `sso.providers`, `sso.groupRoles`, `sso.singleTenant` and `sso.localBreakGlass` values that render the gateway environment, with a values-schema check that provider ids match configured connectors.\n\n## Acceptance criteria\n- [ ] Rendering with `sso.dex.enabled` produces Dex with CRD storage and a client secret shared with the gateway through one Secret.\n- [ ] A rendering test fails when a provider id has no matching connector.\n- [ ] `KIONGA_LOCAL_LOGIN=true` renders only together with a break-glass password secret reference.\n- [ ] The managed Kubernetes guide documents the values."
+  }
+]
