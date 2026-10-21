@@ -22,6 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0               # gitleaks scans the full history
       - uses: actions/setup-go@v5
         with:
           go-version-file: ${{ inputs.working-directory }}/go.mod
@@ -31,3 +32,12 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
       - run: go build ./...
+      # Security gates. Reviewed false positives carry a "#nosec <rule> -- reason"
+      # comment at the site; secrets in test fixtures go in .gitleaksignore.
+      - name: govulncheck (fails on any reachable vulnerability)
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - name: gosec
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.29.0 -quiet -exclude-dir=build -severity medium -confidence medium ./...
+      - name: gitleaks (full history)
+        working-directory: ${{ github.workspace }}
+        run: go run github.com/zricethezav/gitleaks/v8@v8.30.1 git --no-banner --redact .
