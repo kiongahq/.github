@@ -17,21 +17,37 @@ jobs:
           cache: false
       - name: Validate workflow syntax and shell commands
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+      - name: Install YAML parser
+        run: python3 -m pip install PyYAML==6.0.3
       - name: Require immutable external actions and reusable workflows
         shell: bash
         run: |
           python3 - <<'PYCODE'
-          import pathlib, re, sys
+          import pathlib, re, sys, yaml
           errors = []
-          for path in pathlib.Path('.github/workflows').glob('*'):
-              if path.suffix not in ('.yaml', '.yml'):
-                  continue
-              for line, text in enumerate(path.read_text().splitlines(), 1):
-                  match = re.match(r'\s*(?:-\s*)?uses:\s*[\"\']?([^\s\"\'#]+)', text)
-                  if not match or match[1].startswith('./'):
+          files = list(pathlib.Path('.github/workflows').glob('*.yml'))
+          files += list(pathlib.Path('.github/workflows').glob('*.yaml'))
+          files += list(pathlib.Path('.').rglob('action.yml'))
+          files += list(pathlib.Path('.').rglob('action.yaml'))
+          for path in sorted(set(files)):
+              data = yaml.safe_load(path.read_text())
+              pending, visited = [data], set()
+              while pending:
+                  node = pending.pop()
+                  if not isinstance(node, (dict, list)) or id(node) in visited:
                       continue
-                  if not re.fullmatch(r'[\w./-]+@[0-9a-f]{40}', match[1]):
-                      errors.append(f'{path}:{line}: external uses must be pinned to a full commit SHA')
+                  visited.add(id(node))
+                  if isinstance(node, list):
+                      pending.extend(node)
+                      continue
+                  pending.extend(node.values())
+                  if 'uses' not in node:
+                      continue
+                  reference = node['uses']
+                  if isinstance(reference, str) and reference.startswith('./'):
+                      continue
+                  if not isinstance(reference, str) or not re.fullmatch(r'[\w./-]+@[0-9a-f]{40}', reference):
+                      errors.append(f'{path}: external uses must be pinned to a full commit SHA')
           print('\n'.join(errors) if errors else 'All external actions and reusable workflows are immutable.')
           sys.exit(bool(errors))
           PYCODE
