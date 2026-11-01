@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   guardrails:
     uses: ./.github/workflows/guardrails.yml

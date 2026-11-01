@@ -86,7 +86,9 @@ def main():
             if verified.get(key) != desired[key]:
                 raise RuntimeError(f'Ruleset verification failed for {key}')
         for rule in desired['rules']:
-            if rule not in verified['rules']:
+            saved = next((item for item in verified['rules'] if item['type'] == rule['type']), None)
+            if saved is None or any(saved.get('parameters', {}).get(key) != value
+                                    for key, value in rule.get('parameters', {}).items()):
                 raise RuntimeError(f'Ruleset verification failed for {rule["type"]}')
         print(f'{args.repository}: verified {actual["name"]} ({actual["id"]})')
 
