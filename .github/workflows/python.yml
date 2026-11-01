@@ -14,7 +14,7 @@ on:
         type: string
         default: "3.11"
       install:
-        description: Command that installs the component and its test dependencies
+        description: Supported installation mode (pip install -r requirements-dev.txt or pip install -e ".[dev]")
         type: string
         required: true
 
@@ -34,7 +34,15 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
           cache: pip
-      - run: ${{ inputs.install }}
+      - name: Install project test dependencies
+        env:
+          INSTALL_MODE: ${{ inputs.install }}
+        run: |
+          case "$INSTALL_MODE" in
+            'pip install -r requirements-dev.txt') pip install -r requirements-dev.txt ;;
+            'pip install -e ".[dev]"') pip install -e ".[dev]" ;;
+            *) echo "Unsupported dependency installation mode" >&2; exit 1 ;;
+          esac
       - run: pip install "ruff>=0.5" "pytest>=8.0"
       - run: ruff check .
       - run: python -m pytest -q
