@@ -35,7 +35,7 @@ def desired_rules(repo):
         'target': 'branch',
         'enforcement': 'active',
         'bypass_actors': [],
-        'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH', 'refs/heads/main'], 'exclude': []}},
+        'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH', 'refs/heads/main', 'refs/heads/master'], 'exclude': []}},
         'rules': [
             {'type': 'deletion'}, {'type': 'non_fast_forward'},
             {'type': 'pull_request', 'parameters': {
