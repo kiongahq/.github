@@ -1,0 +1,17 @@
+name: Validate release metadata
+description: Check version alignment and the provenance of a release tag
+inputs:
+  tag:
+    description: Published release tag; omit for pull-request validation
+    default: ''
+  default-branch:
+    description: Reviewed branch containing the release commit
+    default: main
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        RELEASE_TAG: ${{ inputs.tag }}
+        DEFAULT_BRANCH: ${{ inputs.default-branch }}
+      run: python3 "$GITHUB_ACTION_PATH/validate.py"

@@ -11,3 +11,5 @@
 .codex/
 .cursor/
 .aider*
+__pycache__/
+*.py[cod]

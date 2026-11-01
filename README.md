@@ -11,7 +11,7 @@ list.
 | `profile/README.md` | The organization's GitHub profile page |
 | `.github/workflows/go.yml` | Reusable Go checks: gofmt, vet, race tests and build, then govulncheck, gosec and gitleaks |
 | `.github/workflows/python.yml` | Reusable Python checks: install, ruff and pytest, then pip-audit, bandit and gitleaks |
-| `.github/workflows/image.yml` | Reusable image build; publishes `ghcr.io/kiongahq/<image>` from `main` and `v*` tags |
+| `.github/workflows/image.yml` | Reusable image build; publishes `ghcr.io/kiongahq/<image>` from the default branch and published releases |
 | `repos.txt` | Every Kionga repository, in dependency order |
 | `roadmap/` | Improvement issue sources, by month |
 | `migration/` | Record of how the repositories were split out of the original monorepo |
@@ -23,20 +23,22 @@ Call a workflow from a component repository:
 ```yaml
 jobs:
   go:
-    uses: kiongahq/.github/.github/workflows/go.yml@main
+    uses: kiongahq/.github/.github/workflows/go.yml@REVIEWED_COMMIT_SHA
   image:
     needs: go
-    uses: kiongahq/.github/.github/workflows/image.yml@main
-    permissions: {contents: read, packages: write}
+    uses: kiongahq/.github/.github/workflows/image.yml@REVIEWED_COMMIT_SHA
+    permissions: {contents: write, packages: write}
     with: {image: serving-manager}
 ```
 
 `python.yml` takes a required `install` command (for example
 `pip install -r requirements-dev.txt`) and an optional `python-version` (default
 `3.11`). `image.yml` takes `image` and optionally `context`, `dockerfile`,
-`build-args` and `platforms`. Images are tagged `sha-<short>`, `latest` on the
-default branch, and `X.Y.Z` and `X.Y` on semantic version tags; pull requests build
-without publishing.
+`build-args` and `platforms`. Replace `REVIEWED_COMMIT_SHA` with a reviewed full
+commit SHA. Development images use `edge`, `sha-<short>` and `sha-<full>`. Published
+releases use exact `X.Y.Z` tags and attach image digest records to their release.
+Pull requests build without publishing. Existing `latest` tags stop updating;
+deployments should use digests. Publication rejects overwriting a release version.
 
 ## Security gates
 
@@ -64,3 +66,11 @@ Both are kept as a record and are not part of any build.
 ## License
 
 [MIT](LICENCE) © Kionga contributors
+
+## Release lifecycle
+
+`release/validate` checks version files and published tag provenance. Its tests
+run with `python3 -m unittest discover -s release/tests`. Each component uses
+Release Please to prepare reviewed version/changelog PRs before publication.
+The [release handbook](https://kiongahq.github.io/docs/engineering/contributing/releases/)
+documents credentials, artifact locations, PyPI setup and rollback rules.
