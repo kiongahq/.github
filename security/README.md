@@ -1,8 +1,8 @@
 # Repository merge controls
 
-The default branch, `main`, and `master` are release boundaries, including when these named branches are created later. All public repositories require pull requests, one fresh approving review, code-owner approval, resolution of review conversations, and successful required checks against an up-to-date base. Approvals are dismissed after new commits; the latest reviewable push must be approved by another person. Administrators and automation have no bypass entry. Deletion and force-pushing are blocked for these branches and `v*` release tags.
+The default branch, `main`, and `master` are release boundaries, including when these named branches are created later. All public repositories require pull requests, resolution of review conversations, and successful required checks against an up-to-date base. While the organization has one maintainer, approval counts are zero and mandatory code-owner, latest-push, and unattributed-change approvals are disabled. Optional approvals are dismissed after new commits. Administrators and automation have no bypass entry. Deletion and force-pushing are blocked for these branches and `v*` release tags.
 
-A maintainer cannot approve their own pull request. With only one maintainer, add another trusted reviewer with write access and update CODEOWNERS before expecting maintainer-authored changes to merge. Do not temporarily weaken rules to merge routine changes. Organization owners can still change repository settings; repository rules cannot defend against a compromised owner account. Use strong MFA, preferably hardware-backed passkeys, and narrowly scoped GitHub App credentials.
+A maintainer cannot approve their own pull request. The sole maintainer reviews the diff, resolves comments, waits for required checks, and merges the pull request without a separate approving review. This also means no human approval is enforced for other authors; grant write access deliberately. When another trusted maintainer joins, update CODEOWNERS and enable independent review with the script option below. Do not disable test or security gates to merge changes. Organization owners can still change repository settings; repository rules cannot defend against a compromised owner account. Use strong MFA, preferably hardware-backed passkeys, and narrowly scoped GitHub App credentials.
 
 ## Required verification
 
@@ -12,7 +12,7 @@ A maintainer cannot approve their own pull request. With only one maintainer, ad
 - CodeQL uses the extended query suite. Merge protection blocks security alerts of medium severity or higher and code-quality errors; missing or incomplete analysis also blocks merging.
 - Dependabot checks supported manifests and Actions weekly. Security-update PRs require the same review and checks as other changes; they are not automatically merged.
 
-Checks are bound to the GitHub Actions application. Workflow files, CODEOWNERS, and scanner exclusions require code-owner review. Review these changes carefully: status-check names alone cannot prove that an untrusted workflow ran the intended checks. Organization-level required workflows provide stronger central enforcement where the GitHub plan supports them.
+Checks are bound to the GitHub Actions application. Keep CODEOWNERS to identify ownership and support future independent review. The maintainer must inspect workflow files, CODEOWNERS, and scanner exclusions carefully: status-check names alone cannot prove that an untrusted workflow ran the intended checks. Organization-level required workflows provide stronger central enforcement where the GitHub plan supports them.
 
 ## CI trust boundaries
 
@@ -25,6 +25,8 @@ Secret scanning, push protection, private vulnerability reporting, Dependabot al
 ## Administration and onboarding
 
 `python3 security/repository_rules.py REPOSITORY` prints the intended rules. Add `--apply` to create or reconcile only the named managed rulesets. Install and verify the workflows and CodeQL first. Applying a required check that never runs intentionally blocks merges.
+
+The default configuration supports a sole maintainer. Once another trusted reviewer is available, use `python3 security/repository_rules.py REPOSITORY --require-independent-review --apply` to require one fresh approval, code-owner review, and independent approval of the latest push. Continue passing that option on subsequent reconciliations while independent review is required.
 
 Before adding a repository, configure CODEOWNERS, the shared guardrails workflow at a reviewed commit SHA, the component-specific CI checks, Dependabot, CodeQL, secret protection, read-only workflow permissions, and approval for all external contributors. Add its exact PR check names to the script and apply the rules. Verify the saved configuration and effective rules for both `main` and `master` through GitHub after each change. If using `master`, ensure all required checks and code scanning run for pull requests targeting it; missing checks must block merging.
 
