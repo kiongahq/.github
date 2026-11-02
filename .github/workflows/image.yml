@@ -1,17 +1,8 @@
 name: Image
 
-# Reusable image build. Publishes ghcr.io/kiongahq/<image> on pushes to main and
-# v* tags; on pull requests it only builds. Tags:
-#   sha-<short>  every build (immutable pin)
-#   latest       default branch
-#   X.Y.Z, X.Y   semver git tags
-#
-#   jobs:
-#     image:
-#       uses: kiongahq/.github/.github/workflows/image.yml@main
-#       permissions: {contents: read, packages: write}
-#       with: {image: serving-manager}
-
+# Development builds publish edge and SHA references. Published stable releases
+# publish only their exact X.Y.Z version. Deployments should pin image digests.
+# Release tags must resolve to reviewed default-branch commits.
 on:
   workflow_call:
     inputs:
@@ -51,10 +42,11 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}
           tags: |
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short,enable=${{ github.event_name != 'release' }}
+            type=sha,format=long,enable=${{ github.event_name != 'release' }}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
+          flavor: latest=false
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -84,9 +76,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     if: >-
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v'))
+      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      (github.event_name == 'release' && github.event.action == 'published' && !github.event.release.prerelease)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -100,7 +95,22 @@ jobs:
       - name: Require releases to contain reviewed default-branch commits
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            python3 - <<'PYCODE'
+          import json, os, pathlib, re
+          tag = os.environ["RELEASE_TAG"]
+          version = pathlib.Path("version.txt").read_text().strip()
+          if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag) or tag != "v" + version or version == "0.0.0":
+              raise SystemExit("Release tag must match the reviewed version.txt")
+          if json.loads(pathlib.Path(".release-please-manifest.json").read_text()) != {".": version}:
+              raise SystemExit("Release manifest and version.txt must agree")
+          if not re.search(r"^## \[?" + re.escape(version) + r"(?:\]|\s|$)", pathlib.Path("CHANGELOG.md").read_text(), re.MULTILINE):
+              raise SystemExit("Release must have a changelog entry")
+          PYCODE
+          fi
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -109,15 +119,30 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite an existing release image
+        if: github.event_name == 'release'
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:${TAG#v}" > /dev/null 2> "$RUNNER_TEMP/registry-error"; then
+            echo "::error::This release image already exists. Rerun failed jobs only; never overwrite a release version."
+            exit 1
+          fi
+          if ! grep -qiE 'manifest unknown|not found' "$RUNNER_TEMP/registry-error"; then
+            cat "$RUNNER_TEMP/registry-error" >&2
+            exit 1
+          fi
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}
           tags: |
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short,enable=${{ github.event_name != 'release' }}
+            type=sha,format=long,enable=${{ github.event_name != 'release' }}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
+          flavor: latest=false
       - id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -145,3 +170,27 @@ jobs:
             echo "$IMAGE_TAGS"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  record-release:
+    if: github.event_name == 'release'
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Attach the published digest to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}
+          IMAGE_NAME: ${{ inputs.image }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 - <<'PYCODE'
+          import json, os, pathlib
+          record = {"image": os.environ["IMAGE"], "digest": os.environ["DIGEST"],
+                    "tag": os.environ["TAG"], "commit": os.environ["GITHUB_SHA"]}
+          pathlib.Path("image.json").write_text(json.dumps(record, indent=2) + "\n")
+          PYCODE
+          mv image.json "${IMAGE_NAME}-digest.json"
+          gh release upload "$TAG" "${IMAGE_NAME}-digest.json" --repo "$GITHUB_REPOSITORY"
