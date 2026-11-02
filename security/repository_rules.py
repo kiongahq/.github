@@ -29,20 +29,21 @@ def api(method, path, body=None):
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def desired_rules(repo):
+def desired_rules(repo, independent_review=False):
     return [{
         'name': 'Reviewed and verified default branch',
         'target': 'branch',
         'enforcement': 'active',
         'bypass_actors': [],
-        'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH', 'refs/heads/main'], 'exclude': []}},
+        'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH', 'refs/heads/main', 'refs/heads/master'], 'exclude': []}},
         'rules': [
             {'type': 'deletion'}, {'type': 'non_fast_forward'},
             {'type': 'pull_request', 'parameters': {
-                'required_approving_review_count': 1,
+                'required_approving_review_count': 1 if independent_review else 0,
                 'dismiss_stale_reviews_on_push': True,
-                'require_code_owner_review': True,
-                'require_last_push_approval': True,
+                'require_code_owner_review': independent_review,
+                'require_last_push_approval': independent_review,
+                'require_extra_approval_for_unattributed_changes': independent_review,
                 'required_review_thread_resolution': True,
             }},
             {'type': 'required_status_checks', 'parameters': {
@@ -68,8 +69,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('repository', choices=sorted(CHECKS))
     parser.add_argument('--apply', action='store_true', help='Write the managed rulesets to GitHub')
+    parser.add_argument('--require-independent-review', action='store_true',
+                        help='Require fresh code-owner approval when another trusted reviewer is available')
     args = parser.parse_args()
-    rulesets = desired_rules(args.repository)
+    rulesets = desired_rules(args.repository, args.require_independent_review)
     if not args.apply:
         print(json.dumps(rulesets, indent=2))
         return
