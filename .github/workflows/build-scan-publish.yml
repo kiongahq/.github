@@ -1,0 +1,281 @@
+name: Build, scan and publish
+
+# Reusable workflow for kiongahq services. A caller repo passes its own inputs (see below).
+#
+# Flow:
+#   discover  -> find the image(s): the root Dockerfile, or every Dockerfile when multi_docker is true
+#   scan-repo -> Trivy on the source: any secret fails, HIGH/CRITICAL fixable CVEs fail
+#   build     -> one matrix job per image: build, scan the built image, save it as an artifact
+#   publish   -> only when every image passed, and only for a default-branch push or a published release
+#                (default-branch pushes get edge and sha tags, releases get the semver tag, as image.yml does)
+#
+# Publishing to GHCR uses the workflow token. Other registries need REGISTRY_USERNAME and REGISTRY_PASSWORD.
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: Registry host. ghcr.io uses the workflow token.
+        type: string
+        default: ghcr.io
+      namespace:
+        description: Registry namespace. Defaults to the repository owner.
+        type: string
+        default: ''
+      multi_docker:
+        description: Build every Dockerfile in the repo, named after its parent directory
+        type: boolean
+        default: false
+      image:
+        description: Single-image name. Defaults to the repository name.
+        type: string
+        default: ''
+      dockerfile:
+        description: Single-image Dockerfile path, relative to the repo root
+        type: string
+        default: Dockerfile
+      context:
+        description: Single-image build context, relative to the repo root
+        type: string
+        default: .
+      platforms:
+        type: string
+        default: linux/amd64
+      trivy_severity:
+        description: Severities that fail the vulnerability scans
+        type: string
+        default: HIGH,CRITICAL
+    secrets:
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.matrix.outputs.images }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Find images
+        id: matrix
+        env:
+          MULTI_DOCKER: ${{ inputs.multi_docker }}
+          IMAGE_NAME: ${{ inputs.image }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          BUILD_CONTEXT: ${{ inputs.context }}
+        run: |
+          set -euo pipefail
+          name_re='^[a-z0-9]+([._-][a-z0-9]+)*$'
+          repo_name="${GITHUB_REPOSITORY##*/}"
+          skip='(^|/)(\.git|\.venv|venv|node_modules|build|target|dist|\.gradle|vendor|\.tox|__pycache__)/'
+          declare -A seen
+          items=()
+
+          check_name() {
+            if [[ ! "$1" =~ $name_re ]]; then
+              echo "::error::'$1' (from $2) is not a valid image name. Use lowercase letters, digits, '-', '_' or '.'." >&2
+              exit 1
+            fi
+          }
+
+          if [ "$MULTI_DOCKER" = "true" ]; then
+            files=$(find . -name Dockerfile -type f | sed 's|^\./||' | { grep -v -E "$skip" || true; } | sort)
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              dir=$(dirname "$f")
+              if [ "$dir" = "." ]; then
+                name="${IMAGE_NAME:-$repo_name}"
+                ctx="."
+              else
+                name=$(basename "$dir")
+                ctx="$dir"
+              fi
+              check_name "$name" "$f"
+              if [ -n "${seen[$name]:-}" ]; then
+                echo "::error::image name '$name' is used by ${seen[$name]} and $f. Directory names must be unique." >&2
+                exit 1
+              fi
+              seen[$name]="$f"
+              items+=("$(jq -cn --arg n "$name" --arg c "$ctx" --arg d "$f" '{name: $n, context: $c, dockerfile: $d}')")
+            done <<< "$files"
+          else
+            name="${IMAGE_NAME:-$repo_name}"
+            check_name "$name" image
+            items+=("$(jq -cn --arg n "$name" --arg c "$BUILD_CONTEXT" --arg d "$DOCKERFILE" '{name: $n, context: $c, dockerfile: $d}')")
+          fi
+
+          if [ "${#items[@]}" -eq 0 ]; then
+            echo "::error::No Dockerfile found. Check the repo layout, or set multi_docker for services in subdirectories." >&2
+            exit 1
+          fi
+
+          matrix=$(printf '%s\n' "${items[@]}" | jq -sc '.')
+          echo "images=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Images: $(echo "$matrix" | jq -r '[.[].name] | join(", ")')"
+
+  scan-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Secrets first, with no severity filter: a leaked key fails the build whatever its rating.
+      - name: Secret scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          exit-code: '1'
+          version: v0.76.2
+
+      - name: Dependency scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: true
+          exit-code: '1'
+          version: v0.76.2
+          trivyignores: ${{ hashFiles('.trivyignore') != '' && '.trivyignore' || '' }}
+
+  build:
+    needs: [discover, scan-repo]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # build and scan every image, so one failure still shows the rest
+      matrix:
+        image: ${{ fromJson(needs.discover.outputs.images) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          pull: true
+          load: true
+          tags: ${{ matrix.image.name }}:scan
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ matrix.image.name }}:scan
+          scanners: vuln,secret
+          severity: ${{ inputs.trivy_severity }}
+          ignore-unfixed: true
+          exit-code: '1'
+          version: v0.76.2
+          trivyignores: ${{ hashFiles('.trivyignore') != '' && '.trivyignore' || '' }}
+
+      # The published image is this exact image, not a second build.
+      - name: Save image
+        env:
+          IMG: ${{ matrix.image.name }}
+        run: docker save "$IMG:scan" | gzip > "$IMG.tar.gz"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: image-${{ matrix.image.name }}
+          path: ${{ matrix.image.name }}.tar.gz
+          retention-days: 1
+
+  publish:
+    # needs: build is all-or-nothing. If any image failed, nothing is published.
+    needs: [discover, build]
+    if: >-
+      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      (github.event_name == 'release' && github.event.action == 'published' && !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.discover.outputs.images) }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: image-${{ matrix.image.name }}
+
+      - name: Log in to GHCR
+        if: inputs.registry == 'ghcr.io'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to registry
+        if: inputs.registry != 'ghcr.io'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        env:
+          NAMESPACE: ${{ inputs.namespace || github.repository_owner }}
+        with:
+          images: ${{ inputs.registry }}/${{ env.NAMESPACE }}/${{ matrix.image.name }}
+          tags: |
+            type=sha,format=short,enable=${{ github.event_name != 'release' }}
+            type=sha,format=long,enable=${{ github.event_name != 'release' }}
+            type=raw,value=edge,enable={{is_default_branch}}
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'release' }}
+          flavor: latest=false
+
+      # Releases never overwrite an existing version tag, as image.yml enforces.
+      - name: Refuse to overwrite a release image
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TAG_LIST: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          semver_ref=$(printf '%s\n' "$TAG_LIST" | grep -E ':[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+          [ -n "$semver_ref" ] || { echo "::error::no semver tag for release $RELEASE_TAG" >&2; exit 1; }
+          if docker buildx imagetools inspect "$semver_ref" > /dev/null 2> "$RUNNER_TEMP/registry-error"; then
+            echo "::error::$semver_ref already exists. Rerun failed jobs only; never overwrite a release version." >&2
+            exit 1
+          fi
+          if ! grep -qiE 'manifest unknown|not found' "$RUNNER_TEMP/registry-error"; then
+            cat "$RUNNER_TEMP/registry-error" >&2
+            exit 1
+          fi
+
+      - name: Load, tag and push
+        env:
+          IMG: ${{ matrix.image.name }}
+          TAG_LIST: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          gunzip -c "$IMG.tar.gz" | docker load
+          while IFS= read -r ref; do
+            [ -z "$ref" ] && continue
+            docker tag "$IMG:scan" "$ref"
+            docker push "$ref"
+          done <<< "$TAG_LIST"
