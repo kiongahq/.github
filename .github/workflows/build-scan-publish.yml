@@ -9,6 +9,9 @@ name: Build, scan and publish
 #   publish   -> only when every image passed, and only for a default-branch push or a published release
 #                (default-branch pushes get edge and sha tags, releases get the semver tag, as image.yml does)
 #
+# The HIGH,CRITICAL threshold is fixed so a caller cannot weaken it. Accept a specific CVE
+# through a reviewed .trivyignore in the caller repo instead.
+#
 # Publishing to GHCR uses the workflow token. Other registries need REGISTRY_USERNAME and REGISTRY_PASSWORD.
 
 on:
@@ -41,10 +44,6 @@ on:
       platforms:
         type: string
         default: linux/amd64
-      trivy_severity:
-        description: Severities that fail the vulnerability scans
-        type: string
-        default: HIGH,CRITICAL
     secrets:
       REGISTRY_USERNAME:
         required: false
@@ -146,7 +145,7 @@ jobs:
           scan-type: fs
           scan-ref: .
           scanners: vuln
-          severity: ${{ inputs.trivy_severity }}
+          severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '1'
           version: v0.76.2
@@ -184,7 +183,7 @@ jobs:
           scan-type: image
           image-ref: ${{ matrix.image.name }}:scan
           scanners: vuln,secret
-          severity: ${{ inputs.trivy_severity }}
+          severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: '1'
           version: v0.76.2
